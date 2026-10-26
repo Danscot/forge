@@ -393,3 +393,91 @@ def test_dashboard_pause_resume_toggle():
     assert d._live is not None
     d.stop("completed")
     assert d._live is None
+
+
+def test_dashboard_thinking_and_code_streams():
+    from forge_harness.utils.dashboard import Dashboard
+    console = Console(file=io.StringIO(), width=130, force_terminal=False)
+    d = Dashboard("run1", "interactive", {}, console=console)
+    d.start()
+    # Streaming thinking deltas
+    d.on_llm_event("llm_reasoning_delta", {"agent": "coder", "text": "Let me plan the patch structure..."})
+    d.on_llm_event("llm_reasoning_delta", {"agent": "coder", "text": " I need to create HomeScreen.tsx"})
+    assert d.last_thinking_tokens > 0
+    assert d.thinking_tokens > 0
+    thinking_msgs = [m for m in d.messages if m.kind == "thinking"]
+    assert len(thinking_msgs) == 2
+    assert "Let me plan" in thinking_msgs[0].content
+
+    # Streaming code deltas
+    d.on_llm_event("llm_text_delta", {"agent": "coder", "text": "{ \"operations\": ["})
+    d.on_llm_event("llm_text_delta", {"agent": "coder", "text": " { \"type\": \"create_file\" } }"})
+    code_msgs = [m for m in d.messages if m.kind == "code"]
+    assert len(code_msgs) == 2
+
+    # Request done with thinking tokens in usage
+    d.on_llm_event("llm_request_done", {
+        "agent": "coder",
+        "duration_s": 1.5,
+        "usage": {"prompt_tokens": 100, "completion_tokens": 200, "total_tokens": 300, "thinking_tokens": 50},
+        "finish_reason": "stop",
+    })
+    assert d.last_thinking_tokens == 50
+    assert d.thinking_tokens > 50  # accumulated from deltas + usage
+    assert d.total_tokens == 300
+    result_msgs = [m for m in d.messages if m.kind == "result"]
+    assert len(result_msgs) == 1
+    assert "thinking: 50 tok" in result_msgs[0].content
+    d.stop("completed")
+
+
+def test_dashboard_command_visibility():
+    from forge_harness.utils.dashboard import Dashboard
+    console = Console(file=io.StringIO(), width=130, force_terminal=False)
+    d = Dashboard("run1", "interactive", {}, console=console)
+    d.start()
+    d.on_command_start(["npx", "tsc", "--noEmit"], agent="coder")
+    cmd_msgs = [m for m in d.messages if m.kind == "command"]
+    assert len(cmd_msgs) == 1
+    assert "$ npx tsc --noEmit" in cmd_msgs[0].content
+
+    d.on_command_done({"exit_code": 0, "duration_s": 2.5, "command": ["npx", "tsc", "--noEmit"], "timed_out": False}, agent="coder")
+    result_msgs = [m for m in d.messages if m.kind == "result"]
+    assert len(result_msgs) == 1
+    assert "exit 0" in result_msgs[0].content
+    assert "(2.5s)" in result_msgs[0].content
+
+    # Failed command
+    d.on_command_done({"exit_code": 2, "duration_s": 1.0, "command": ["npx", "tsc", "--noEmit"], "timed_out": False}, agent="coder")
+    result_msgs = [m for m in d.messages if m.kind == "result"]
+    assert len(result_msgs) == 2
+    assert "exit 2" in result_msgs[1].content
+    d.stop("completed")
+
+
+def test_dashboard_plan_and_patch():
+    from forge_harness.utils.dashboard import Dashboard
+    console = Console(file=io.StringIO(), width=130, force_terminal=False)
+    d = Dashboard("run1", "interactive", {}, console=console)
+    d.start()
+    d.on_plan({
+        "summary": "Create HomeScreen and update App.tsx",
+        "risk": "low",
+        "operations": [
+            {"type": "create_file", "path": "src/screens/HomeScreen.tsx", "reason": "New screen"},
+            {"type": "replace_text", "path": "App.tsx", "reason": "Bootstrap screen"},
+        ],
+    }, agent="coder")
+    plan_msgs = [m for m in d.messages if m.kind == "plan"]
+    assert len(plan_msgs) == 1
+    assert "Create HomeScreen" in plan_msgs[0].content
+    assert "Operations: 2" in plan_msgs[0].content
+
+    d.on_patch_applied([
+        {"type": "create_file", "path": "src/screens/HomeScreen.tsx"},
+        {"type": "replace_text", "path": "App.tsx"},
+    ], agent="coder")
+    patch_msgs = [m for m in d.messages if m.kind == "code"]
+    assert len(patch_msgs) == 1
+    assert "Applied 2 surgical file operation(s)" in patch_msgs[0].content
+    d.stop("completed")

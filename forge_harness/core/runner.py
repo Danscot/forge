@@ -90,6 +90,7 @@ class HarnessRunner:
         self.current_task_id: str | None = None
         self.current_stage: str | None = None
         self.current_attempt: int = 0
+        self.active_agent: str = "orchestrator"
         self._server: ExpoServer | None = None
         self._events_file: Path | None = None
         self._task_artifacts: Path | None = None
@@ -222,6 +223,7 @@ class HarnessRunner:
                         diagnostics_in = (task.last_report or {}).get("diagnostic", {})
                         registry_snapshot = self.registry.refresh()
                         self.dashboard.active_agent = "coder"
+                        self.active_agent = "coder"
                         # On retries, restore the pre-task snapshot so every attempt plans
                         # from a clean baseline rather than a half-applied previous attempt.
                         if attempt_index > 0:
@@ -287,6 +289,7 @@ class HarnessRunner:
                         apply_results = coder_agent.apply_patch(patch, self.file_ops)
                         if not apply_results:
                             raise AgentOutputError("Patch application reported success but applied no file operations")
+                        self.dashboard.on_patch_applied(apply_results, agent=self.active_agent or "coder")
                         if any(Path(str(result.get("path", ""))).name == "package.json" for result in apply_results):
                             install_result = self._run_command(["npm", "install"], timeout=300)
                             install_result["passed"] = install_result.get("exit_code") == 0 and not install_result.get("timed_out")
@@ -583,6 +586,7 @@ class HarnessRunner:
         risk = str(plan.get("risk", "low")).upper()
         style = {"LOW": "green", "MEDIUM": "yellow", "HIGH": "bold red"}.get(risk, "white")
         self.dashboard.activity_message("PLAN", f"Change plan ({risk} risk): {plan.get('summary', 'No summary')}")
+        self.dashboard.on_plan(plan, agent=self.active_agent or "coder")
         table = Table(title=f"Surgical change plan · {risk} risk", expand=True)
         table.add_column("Operation", style="cyan")
         table.add_column("File")
@@ -609,7 +613,12 @@ class HarnessRunner:
         return result
 
     def _run_command(self, command: list[str] | str, timeout: int = 60) -> dict[str, Any]:
-        return run_shell(command, cwd=self.project_root, timeout=timeout, config=self.config, logger=logging.getLogger("forge.shell"))
+        if self.dashboard:
+            self.dashboard.on_command_start(command, agent=self.active_agent or "orchestrator")
+        result = run_shell(command, cwd=self.project_root, timeout=timeout, config=self.config, logger=logging.getLogger("forge.shell"))
+        if self.dashboard:
+            self.dashboard.on_command_done(result, agent=self.active_agent or "orchestrator")
+        return result
 
     def _ensure_server(self) -> str:
         if self._server:

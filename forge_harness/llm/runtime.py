@@ -82,6 +82,7 @@ def _usage(payload: Any) -> dict[str, int]:
         "prompt_tokens": ("prompt_tokens", "input_tokens"),
         "completion_tokens": ("completion_tokens", "output_tokens"),
         "total_tokens": ("total_tokens",),
+        "thinking_tokens": ("thinking_tokens", "reasoning_tokens"),
     }
     result: dict[str, int] = {}
     for canonical, keys in aliases.items():

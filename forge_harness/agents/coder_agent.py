@@ -102,7 +102,12 @@ class CoderAgent(BaseAgent):
                 raise AgentOutputError(f"Plan attempts to create an existing file: {path}")
             if operation_type == "replace_text":
                 if not target.is_file():
-                    raise AgentOutputError(f"replace_text target does not exist: {path}")
+                    # After a snapshot restore, files created in earlier attempts no longer exist.
+                    # Rather than hard-failing the plan, auto-upgrade replace_text → create_file so
+                    # the pipeline can proceed deterministically. The patch step will provide content.
+                    operation["type"] = "create_file"
+                    operation.pop("old_text", None)
+                    continue
                 anchor = operation.get("old_text")
                 if not isinstance(anchor, str) or not anchor:
                     raise AgentOutputError(f"replace_text needs an exact old_text anchor: {path}")

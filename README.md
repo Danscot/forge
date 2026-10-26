@@ -1,0 +1,208 @@
+# FORGE — Autonomous React Native Engineering Harness
+
+FORGE is a Python-driven, multi-agent coding harness for Expo + React Native + TypeScript. It accepts an application specification and reference mockups, plans work screen-by-screen, proposes tightly scoped source changes, runs type/runtime checks, captures browser screenshots, asks a multimodal critic to inspect the result, and retries targeted repairs.
+
+**MVP deliverable:** source code inside the selected Expo project. FORGE does not create store submissions or claim that a project is production-ready just because its screens render.
+
+## What is implemented
+
+- Interactive Rich TUI inspired by coding-agent terminals: live activity, current agent/model, streaming output, provider-exposed reasoning stream (when available), request attempts, token usage, latency, validation gates, and task progress.
+- Central OpenAI-compatible LLM runtime with provider profiles and agent-level model selection.
+- Streaming chat completions, token-usage collection when the provider includes it, per-provider headers/parameters, nested parameter mapping, and configurable fallbacks.
+- Configurable temperature, top-p, output token budget, thinking enablement/budget, request parameters, timeouts, streaming, retry counts, exponential backoff, jitter, and JSON-repair attempts.
+- Retryable vs terminal HTTP/network failure classification; failed calls are logged and retried instead of immediately crashing the process.
+- Provider adapters are configured in YAML; provider-specific features can be expressed through `parameter_map` and `request_params` without changing agent implementation.
+- Mockup and asset discovery under `input/mockups/` and `input/assets/`.
+- Master planner, vision specification, coder plan, surgical patch generation, critic, and diagnostic agents with editable prompt files.
+- Strict project-root file guard, excluded secrets, exact unique text anchors, new-file-only full writes, and transactional patch application.
+- Component registry in `.harness/components.json`, refreshed from source and agent metadata.
+- SQLite task/run history, resumable runs, JSONL logs, patch summaries, screenshots, and rollback snapshots.
+- TypeScript gate, Expo Web lifecycle manager, Playwright screenshot engine, browser diagnostics, optional custom functional test command, and task-specific browser steps.
+- Three modes: autonomous, approval checkpoints, and interactive.
+
+## Requirements
+
+- Python 3.11 or newer.
+- Node.js/npm and a target Expo + TypeScript project.
+- An API key for at least one configured LLM provider.
+- Playwright's Chromium browser for browser rendering.
+
+The MVP runs on Expo Web + Playwright. Browser checks do not replace Android/iOS device validation. By default, screenshots capture the configured viewport (not the entire scrollable page); `project.screenshot_full_page` can be enabled for long-page review.
+
+## Install FORGE
+
+From this repository:
+
+```bash
+python3 -m venv .venv
+source venv/bin/activate
+python3 -m pip install -e '.[all]'
+playwright install chromium
+forge --help
+```
+
+If you prefer the repository script, run `python main.py --help`.
+
+## Prepare a project
+
+### Existing Expo project
+
+```bash
+cd /path/to/your-expo-app
+forge init
+cp .env.example .env
+```
+
+Add the API key(s) for your chosen provider to `.env`; the key environment variable names are declared in `.harness/config.yaml`. `.env` is ignored by the initialization helper. Never commit credentials.
+
+Edit `input/app_spec.md` and place reference screenshots in `input/mockups/`. Assets such as logos and illustrations may go in `input/assets/`.
+
+Suggested input tree:
+
+```text
+input/
+├── app_spec.md
+├── mockups/
+│   ├── home.png
+│   ├── course_details.png
+│   └── login.png
+└── assets/
+    └── logo.png
+```
+
+Mockup filenames help screen association but are not strict requirements. The planner can use the input manifest and image content to associate screens; ambiguous mappings are treated as inference, not fact.
+
+### Create an Expo project from scratch
+
+Install FORGE in its own environment, then:
+
+```bash
+forge new my-mobile-app
+cd my-mobile-app
+cp .env.example .env
+```
+
+The `new` command runs `create-expo-app` before initializing FORGE. If that Expo template command changes upstream, create the Expo project manually and run `forge init` inside it.
+
+## Run modes
+
+```bash
+# Interactive CLI session; with no subcommand, forge opens the REPL
+forge
+
+# Build from input/app_spec.md
+forge run
+
+# Inline idea
+forge run --spec "Build a course discovery app with a course card, search, and profile tab"
+
+# Spec file
+forge run --spec-file input/app_spec.md
+
+# One-shot autonomous mode
+forge run --mode autonomous
+
+# Approval checkpoints
+forge run --mode approval
+
+# Resume from a persisted run ID
+forge resume 20261025_221500_a1b2c3
+
+# Inspect project, registry and recent runs
+forge inspect
+
+# View structured logs
+forge logs --tail 150
+forge logs --run-id 20261025_221500_a1b2c3 --raw
+```
+
+The interactive REPL also supports `run`, `resume <run_id>`, `mode <mode>`, `root <path>`, `inspect`, `logs`, `config show`, and `config set <dotted-key> <value>`.
+
+## LLM configuration
+
+All LLM calling tunables belong in `.harness/config.yaml`; the agent source files do not contain hardcoded sampling defaults. The template starts with the NVIDIA, Gemini, OpenRouter, OpenAI, and Z.ai OpenAI-compatible endpoints and agent profiles for `planner`, `vision`, `coder`, `critic`, and `diagnostic`.
+
+Examples:
+
+```bash
+# Change sampling / generation settings without editing Python
+forge config set llm.agents.coder.temperature 0.25
+forge config set llm.agents.coder.top_p 0.9
+forge config set llm.agents.coder.max_output_tokens 12000
+forge config set llm.agents.coder.thinking_enabled true
+forge config set llm.agents.coder.thinking_budget 4096
+forge config set llm.agents.coder.streaming true
+
+# Choose a different model for only the visual critic
+forge config set llm.agents.critic.model 'gemini:gemini-2.5-flash'
+
+# Add a per-agent provider fallback in YAML, e.g.
+# fallback_models:
+#   - model: "gemini:gemini-2.5-flash"
+#     temperature: 0.2
+```
+
+Each profile supports `model`, `temperature`, `top_p`, `max_output_tokens`, `streaming`, `timeout_s`, `thinking_enabled`, `thinking_budget`, arbitrary `request_params`, and `fallback_models`. The parameters that a provider accepts are not universal. Configure `llm.providers.<provider>.parameter_map` to map canonical fields to its API-specific fields; dotted keys build nested objects. `request_params` can provide additional provider-specific JSON fields.
+
+The default endpoint family is OpenAI-compatible, but not every provider/model supports every parameter or multimodal input. An unsupported parameter should be removed or remapped in config; FORGE will surface provider errors rather than pretending a setting took effect.
+
+### Thinking visibility
+
+The TUI displays a **Thinking / reasoning stream** when the API actually returns a configured reasoning field. The default reasoning field names are configurable per provider. Image attachment count and aggregate upload size are capped by `llm.max_images_per_request`, `llm.max_total_image_bytes`, and `project.max_image_bytes`. Some models/providers do not expose a separate thinking stream, even if reasoning is enabled; the panel will state that no stream was received rather than inventing one.
+
+### Token usage and cost
+
+When the provider returns usage on streamed responses, FORGE displays input, output and total tokens. `stream_options.include_usage` is enabled in the sample config for compatible providers that commonly support it. Remove or adjust that parameter if a provider rejects it. Unknown usage is not displayed as zero. Optional per-model prices can be added under `costs.models` to support local cost estimates; the default shows usage without inventing a price.
+
+## Patch safety and recovery
+
+The Coder first proposes a change plan. Python validates every target path and anchor. Only then does the Coder generate operations that must match the approved plan. Existing files can only be changed through an exact unique `replace_text` anchor; `create_file` is the only operation that supplies full content, and only for new files. Patch batches are validated before writing and are applied with atomic writes. The harness excludes common secret files and prevents paths from escaping the project root.
+
+A task snapshot captures the pre-task contents of touched files. If a task exhausts its retry budget, the harness restores those files instead of leaving an unvalidated partial change. The run, task queue, retry information and reports remain in SQLite, so the execution can be resumed after the underlying issue is fixed.
+
+Approval mode asks before task execution and patch application. Interactive mode respects `execution.approve_each_patch`; autonomous mode does not pause for ordinary patch approvals. High-risk policy can be separately configured.
+
+## Logs and artifacts
+
+```text
+.harness/
+├── config.yaml
+├── components.json
+├── state.db
+├── prompts/                 # editable agent prompt files
+├── logs/events.jsonl        # logs outside a run
+└── runs/<run_id>/
+    ├── logs/events.jsonl    # structured JSONL event trace
+    ├── logs/expo.log
+    ├── tasks/<task_id>/
+    │   ├── snapshot.json
+    │   ├── patch_attempt_1.json
+    │   ├── patches/
+    │   └── screenshots/
+    └── ...
+```
+
+Events include run/task IDs, agent, provider/model, retry number, duration, usage when reported, subprocess results, validation gates, and rollback events. Streaming token deltas are visible live but are not copied into the event database one token at a time. Full prompt/response payload capture is disabled by default because it can contain proprietary code or sensitive context. API keys and authorization values are redacted from structured logs.
+
+## Validation model
+
+Functional correctness is weighted at 60% and visual quality at 40%. The weighted score is informational; acceptance also requires hard gates. By default, TypeScript compilation, browser rendering, at least one task-specific functional test, and a critic `PASS` are required. The planner prompt asks for observable per-screen browser checks; informational screens can satisfy this with visible-content assertions. A high weighted score cannot hide a critical/high-severity issue. Configure these gates and `validation.minimum_quality_score` in YAML.
+
+Playwright supports task-provided `test_plan` steps: `assert_visible`, `click`, `fill`, `assert_text`, and `navigate`. Add `project.functional_check_command` for a project-specific test command when needed. A browser smoke pass is not the same as exhaustive interaction testing, so write acceptance criteria and tests for important application behavior.
+
+## Known MVP boundaries
+
+- Rendering is Expo Web + headless Chromium only; native-only platform details are not verified.
+- The OpenAI-compatible interface handles chat completions and common streaming chunks. Provider-specific tools, native JSON-schema modes, and native SDK features require configuration/adapters as needed.
+- Visual acceptance depends on the critic model actually supporting image input. Select a vision-capable model for Planner/Vision/Critic profiles.
+- A persistent provider outage can block a required task, but it is recorded as resumable rather than silently skipped or marked successful.
+- No deployment, store publishing, backend provisioning, or release signing is performed.
+
+## Development and tests
+
+```bash
+python -m pytest
+python -m compileall -q forge_harness
+```
+
+Contributions should keep LLM request behavior centralized, tunables configurable, file changes narrowly scoped, and the CLI useful during both successful and failed runs.

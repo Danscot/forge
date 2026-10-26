@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.harness/state.db*
+.harness/runs/
+.harness/logs/
+node_modules/
+dist/
+
+# FORGE local secrets and run artifacts
+.env.*
+!.env.example

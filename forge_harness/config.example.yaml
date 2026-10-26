@@ -1,0 +1,192 @@
+# FORGE configuration template. Copy to <project>/.harness/config.yaml via `forge init`.
+# The code intentionally does not hardcode model sampling/thinking values; edit these profiles.
+version: 1
+
+project:
+  root: "."
+  input_dir: "input"
+  mockups_dir: "input/mockups"
+  assets_dir: "input/assets"
+  harness_dir: ".harness"
+  navigation_url: "http://127.0.0.1:8081/"
+  expo_command: ["npx", "expo", "start", "--web", "--port", "8081", "--non-interactive"]
+  typecheck_command: ["npx", "tsc", "--noEmit"]
+  functional_check_command: []
+  server_start_timeout_s: 90
+  render_timeout_ms: 45000
+  screenshot_full_page: false
+  browser_viewport:
+    width: 390
+    height: 844
+    device_scale_factor: 2
+  max_mockup_images: 8
+  max_image_bytes: 7000000
+
+execution:
+  default_mode: "interactive" # autonomous | approval | interactive
+  max_task_retries: 3
+  approve_each_patch: true
+  approve_high_risk_in_autonomous: false
+  allow_dependency_install: false
+
+llm:
+  default_provider: "nvidia"
+  streaming: true
+  display_reasoning_stream: true
+  request_timeout_s: 120
+  connect_timeout_s: 20
+  max_retries: 3
+  initial_backoff_s: 1.0
+  max_backoff_s: 25.0
+  backoff_multiplier: 2.0
+  jitter_fraction: 0.25
+  structured_repair_attempts: 1
+  max_images_per_request: 6
+  max_total_image_bytes: 14000000
+  log_payloads: false
+  log_payload_char_limit: 5000
+  # Use full model references here, e.g. ["gemini:gemini-2.5-flash"], rather than bare provider names.
+  fallback_providers: []
+  # Provider adapter maps canonical settings into provider-specific request fields.
+  # Dotted keys are supported, e.g. chat_template_kwargs.enable_thinking.
+  providers:
+    nvidia:
+      base_url: "https://integrate.api.nvidia.com/v1"
+      api_key_env: "NVIDIA_API_KEY"
+      extra_headers: {}
+      static_request_params:
+        stream_options:
+          include_usage: true
+      parameter_map:
+        max_output_tokens: "max_tokens"
+        thinking_enabled: "chat_template_kwargs.enable_thinking"
+        thinking_budget: "chat_template_kwargs.thinking_budget"
+      reasoning_fields: ["reasoning_content", "reasoning", "thinking"]
+    gemini:
+      base_url: "https://generativelanguage.googleapis.com/v1beta/openai/"
+      api_key_env: "GOOGLE_API_KEY"
+      extra_headers: {}
+      static_request_params: {}
+      parameter_map:
+        max_output_tokens: "max_tokens"
+      reasoning_fields: ["reasoning_content", "reasoning", "thinking"]
+    openrouter:
+      base_url: "https://openrouter.ai/api/v1"
+      api_key_env: "OPENROUTER_API_KEY"
+      extra_headers: {}
+      static_request_params:
+        stream_options:
+          include_usage: true
+      parameter_map:
+        max_output_tokens: "max_tokens"
+      reasoning_fields: ["reasoning_content", "reasoning", "thinking"]
+    openai:
+      base_url: "https://api.openai.com/v1"
+      api_key_env: "OPENAI_API_KEY"
+      extra_headers: {}
+      static_request_params:
+        stream_options:
+          include_usage: true
+      parameter_map:
+        max_output_tokens: "max_completion_tokens"
+      reasoning_fields: ["reasoning_content", "reasoning", "thinking"]
+    z_ai:
+      base_url: "https://api.z.ai/api/paas/v4/"
+      api_key_env: "Z_API_KEY"
+      extra_headers: {}
+      static_request_params: {}
+      parameter_map:
+        max_output_tokens: "max_tokens"
+      reasoning_fields: ["reasoning_content", "reasoning", "thinking"]
+
+  # Each agent is independently configurable. Supported canonical keys include:
+  # provider/model, temperature, top_p, max_output_tokens, streaming, timeout_s,
+  # thinking_enabled, thinking_budget, request_params, fallback_models.
+  agents:
+    planner:
+      model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
+      temperature: 0.25
+      top_p: 0.9
+      max_output_tokens: 8192
+      context_window_tokens: null # set to the model's documented context window if known
+      streaming: true
+      thinking_enabled: true
+      thinking_budget: 4096
+      request_params: {}
+      fallback_models: []
+    vision:
+      model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
+      temperature: 0.2
+      top_p: 0.9
+      max_output_tokens: 8192
+      context_window_tokens: null # set to the model's documented context window if known
+      streaming: true
+      thinking_enabled: true
+      thinking_budget: 4096
+      request_params: {}
+      fallback_models: []
+    coder:
+      model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
+      temperature: 0.2
+      top_p: 0.9
+      max_output_tokens: 12000
+      context_window_tokens: null # set to the model's documented context window if known
+      streaming: true
+      thinking_enabled: true
+      thinking_budget: 4096
+      request_params: {}
+      fallback_models: []
+    critic:
+      model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
+      temperature: 0.15
+      top_p: 0.9
+      max_output_tokens: 6000
+      context_window_tokens: null # set to the model's documented context window if known
+      streaming: true
+      thinking_enabled: true
+      thinking_budget: 3072
+      request_params: {}
+      fallback_models: []
+    diagnostic:
+      model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
+      temperature: 0.2
+      top_p: 0.9
+      max_output_tokens: 6000
+      context_window_tokens: null # set to the model's documented context window if known
+      streaming: true
+      thinking_enabled: true
+      thinking_budget: 3072
+      request_params: {}
+      fallback_models: []
+
+logging:
+  level: "INFO"
+  console_level: "WARNING"
+  capture_payloads: false
+  max_event_file_mb: 30
+  backups: 5
+  redact_patterns:
+    - 'sk-[A-Za-z0-9_-]{12,}'
+    - 'nvapi-[A-Za-z0-9_-]{12,}'
+    - '(?i)(api[_-]?key\s*[:=]\s*)[^\s,]+'
+
+validation:
+  functional_weight: 0.6
+  visual_weight: 0.4
+  require_typecheck: true
+  require_runtime_render: true
+  require_functional_checks: true
+  require_visual_critic_when_mockup_exists: true
+  fail_on_page_errors: true
+  fail_on_console_errors: false
+  minimum_quality_score: 75
+
+security:
+  permitted_shell_executables: ["npx", "npm", "node", "python", "python3", "pytest", "git"]
+  blocked_commands: ["rm -rf /", "sudo", "mkfs", "shutdown", "reboot"]
+  excluded_context_names: [".env", ".env.local", ".env.production", "id_rsa", "id_ed25519", "credentials.json"]
+  max_file_bytes: 2000000
+
+costs:
+  # Add pricing per million tokens by provider/model to enable estimates. Unknown prices show as n/a.
+  models: {}

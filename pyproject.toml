@@ -1,0 +1,38 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "forge-mobile-harness"
+version = "0.1.0"
+description = "Configurable multi-agent React Native / Expo coding harness with streaming, retries, and visual validation."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "FORGE contributors" }]
+dependencies = [
+  "httpx>=0.27,<1.0",
+  "typer>=0.12,<1.0",
+  "rich>=13.7,<15.0",
+  "PyYAML>=6.0,<7.0",
+  "python-dotenv>=1.0,<2.0",
+]
+
+[project.optional-dependencies]
+render = ["playwright>=1.45,<2.0"]
+images = ["Pillow>=10.0,<13.0"]
+test = ["pytest>=8.0,<9.0"]
+all = ["playwright>=1.45,<2.0", "Pillow>=10.0,<13.0", "pytest>=8.0,<9.0"]
+
+[project.scripts]
+forge = "forge_harness.cli:app"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["forge_harness*"]
+
+[tool.setuptools.package-data]
+forge_harness = ["prompts/*.md", "config.example.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

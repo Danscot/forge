@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import time
 from pathlib import Path
 from typing import Any
@@ -63,10 +64,12 @@ class PlaywrightRenderer:
                         "images": page.locator("img").count(),
                     }
                     full_page = bool(project_cfg.get("screenshot_full_page", False))
-                    page.screenshot(path=str(screenshot_path), full_page=full_page, animations="disabled", timeout=timeout_ms)
-                    # Capture the initial screen before interaction tests can navigate or mutate it.
+                    # Run interaction tests against the live route before capturing the
+                    # evidence screenshot. A screenshot taken before clicks/navigation
+                    # shows the default screen and makes route-specific assertions fail.
                     for step in test_plan or []:
                         test_results.append(self._run_test_step(page, step, timeout_ms))
+                    page.screenshot(path=str(screenshot_path), full_page=full_page, animations="disabled", timeout=timeout_ms)
                     status_code = response.status if response else None
                 finally:
                     browser.close()
@@ -89,6 +92,33 @@ class PlaywrightRenderer:
         }
 
     @staticmethod
+    def _test_locator(page: Any, selector: str) -> Any:
+        """Resolve browser selectors emitted for React Native testIDs.
+
+        React Native Web commonly exposes ``testID="home-heading"`` as
+        ``data-testid="home-heading"`` rather than ``id="home-heading"``.
+        Planner-generated checks historically used CSS ID selectors (``#home-heading``),
+        so try the requested selector first and fall back to the matching testID when
+        the requested ID does not exist. Other CSS selectors are left untouched.
+        """
+        locator = page.locator(selector)
+        match = re.fullmatch(r"#([A-Za-z_][A-Za-z0-9_-]*)", selector)
+        if not match:
+            return locator
+        try:
+            if locator.count() > 0 and locator.first.is_visible():
+                return locator
+            test_id = match.group(1).replace('\\', '\\\\').replace('"', '\\"')
+            test_id_locator = page.locator(f'[data-testid="{test_id}"]')
+            if test_id_locator.count() > 0:
+                return test_id_locator
+        except Exception:
+            # Keep the original selector so Playwright returns its usual actionable
+            # timeout/error if count inspection itself is unavailable.
+            return locator
+        return locator
+
+    @staticmethod
     def _run_test_step(page: Any, step: dict[str, Any], timeout_ms: int) -> dict[str, Any]:
         action = str(step.get("action", "")).strip()
         selector = str(step.get("selector", "")).strip()
@@ -96,14 +126,14 @@ class PlaywrightRenderer:
         description = str(step.get("description", f"{action} {selector}"))
         try:
             if action == "assert_visible":
-                locator = page.locator(selector)
+                locator = PlaywrightRenderer._test_locator(page, selector)
                 locator.first.wait_for(state="visible", timeout=min(timeout_ms, 7000))
             elif action == "click":
-                page.locator(selector).first.click(timeout=min(timeout_ms, 7000))
+                PlaywrightRenderer._test_locator(page, selector).first.click(timeout=min(timeout_ms, 7000))
             elif action == "fill":
-                page.locator(selector).first.fill(value, timeout=min(timeout_ms, 7000))
+                PlaywrightRenderer._test_locator(page, selector).first.fill(value, timeout=min(timeout_ms, 7000))
             elif action == "assert_text":
-                locator = page.locator(selector)
+                locator = PlaywrightRenderer._test_locator(page, selector)
                 locator.first.wait_for(state="visible", timeout=min(timeout_ms, 7000))
                 if value not in locator.first.inner_text(timeout=3000):
                     raise AssertionError(f"Expected text {value!r} not found")

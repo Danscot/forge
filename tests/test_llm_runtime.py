@@ -154,3 +154,56 @@ def test_effort_policy_allows_per_agent_override_and_opt_out():
     config["llm"]["effort_policy"] = {"enabled": False}
     legacy_runtime = LLMRuntime(config)
     assert legacy_runtime._profile("coder")["thinking_budget"] == 4096
+
+
+def test_request_params_can_carry_provider_native_json_schema():
+    schema = {
+        "type": "object",
+        "properties": {"operations": {"type": "array", "minItems": 1}},
+        "required": ["operations"],
+    }
+    config = {
+        "llm": {
+            "default_provider": "nvidia",
+            "providers": {"nvidia": {"base_url": "https://integrate.api.nvidia.com/v1", "parameter_map": {"max_output_tokens": "max_tokens"}}},
+            "agents": {"coder": {"model": "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b", "max_output_tokens": 4096}},
+        }
+    }
+    runtime = LLMRuntime(config)
+    profile = runtime._profile("coder")
+    profile["structured_output_schema"] = {"name": "forge_test_patch", "schema": schema}
+    payload = runtime._build_payload(
+        "nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b", profile,
+        [{"role": "user", "content": "Return JSON"}], True,
+    )
+    assert payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "forge_test_patch", "schema": schema},
+    }
+
+
+def test_structured_output_schema_is_translated_per_provider():
+    schema = {"type": "object", "properties": {"operations": {"type": "array", "minItems": 1}}, "required": ["operations"]}
+    config = {
+        "llm": {
+            "default_provider": "nvidia",
+            "providers": {
+                "nvidia": {"base_url": "https://integrate.api.nvidia.com/v1"},
+                "openai": {"base_url": "https://api.openai.com/v1", "structured_output": True, "structured_output_format": "openai"},
+            },
+            "agents": {"coder": {"model": "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b", "max_output_tokens": 4096}},
+        }
+    }
+    runtime = LLMRuntime(config)
+    profile = runtime._profile("coder")
+    profile["structured_output_schema"] = {"name": "forge_test_patch", "schema": schema}
+    messages = [{"role": "user", "content": "Return JSON"}]
+
+    nvidia_payload = runtime._build_payload("nvidia", "nvidia/nemotron-3.5-super-vl-120b-a12b", profile, messages, True, agent="coder")
+    openai_payload = runtime._build_payload("openai", "gpt-test", profile, messages, True, agent="coder")
+
+    assert nvidia_payload["response_format"] == {
+        "type": "json_schema",
+        "json_schema": {"name": "forge_test_patch", "schema": schema},
+    }
+    assert openai_payload["response_format"] == {"type": "json_schema", "json_schema": {"name": "forge_test_patch", "schema": schema}}

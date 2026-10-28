@@ -14,6 +14,9 @@ Rules:
 - Create full contents only for brand-new files. Do not create duplicates of registry components; import and reuse them.
 - React Native code must use React Native / Expo compatible APIs; avoid DOM elements, window/document APIs, and CSS files unless this project is explicitly Expo Web-only and its architecture uses them.
 - Preserve current navigation, style conventions, types, and dependencies. Do not install packages unless the task explicitly allows it.
+- Never modify tsconfig.json, package.json, lockfiles, or anything under .harness. If TypeScript cannot resolve a module, remove the import/usage instead of editing tsconfig or adding ambient type declarations.
+- React Native code must import React when using the React namespace (for example `React.useState`); do not rely on React as a UMD global.
+- React Native `testID="x"` is rendered on Expo Web as `data-testid="x"`; use `testID` in JSX and `[data-testid="x"]` in Playwright selectors. Do not invent `data-testid` JSX attributes or `#id` CSS selectors unless the project already uses them.
 - Add accessible labels to interactive controls; use stable testIDs for key interactions where practical.
 - Make the smallest code change that satisfies acceptance criteria and prior diagnostics.
 - Return no markdown fences.

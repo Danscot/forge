@@ -134,6 +134,26 @@ class BaseAgent:
                 continue
         raise AgentOutputError(f"Prompt file is missing: {self.prompt_name}. Run `forge init` to install default prompts.")
 
+    def _structured_profile_override(
+        self,
+        profile_override: dict[str, Any] | None,
+        *,
+        schema_name: str,
+        schema: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        """Attach a provider-neutral structured-output contract to a call.
+
+        The runtime translates this abstract schema into the selected endpoint's
+        native response_format for each candidate model, including fallbacks. NVIDIA
+        supports response_format.json_schema; other providers must opt in explicitly
+        if their endpoint/model supports constrained JSON output.
+        """
+        if not schema:
+            return profile_override
+        merged = dict(profile_override or {})
+        merged["structured_output_schema"] = {"name": schema_name, "schema": schema}
+        return merged
+
     def ask_json(
         self,
         user_text: str,
@@ -141,12 +161,24 @@ class BaseAgent:
         image_paths: list[str | Path] | None = None,
         profile_override: dict[str, Any] | None = None,
         required_nonempty_array: str | None = None,
+        json_schema: dict[str, Any] | None = None,
+        schema_name: str | None = None,
     ) -> tuple[dict[str, Any], LLMResult]:
         messages = [
             {"role": "system", "content": self.system_prompt()},
             {"role": "user", "content": user_text},
         ]
-        result = self.runtime.complete(self.name, messages, image_paths=image_paths, profile_override=profile_override)
+        effective_profile = self._structured_profile_override(
+            profile_override, schema_name=schema_name or f"forge_{self.name}_response", schema=json_schema,
+        )
+        response_attempts: list[str] = []
+        stage_hint = {
+            "forge_coder_change_plan": "planning_changes",
+            "forge_coder_patch": "generating_patch",
+            "forge_application_task_plan": "planning_tasks",
+        }.get(schema_name or f"forge_{self.name}_response")
+        result = self.runtime.complete(self.name, messages, image_paths=image_paths, profile_override=effective_profile)
+        response_attempts.append(result.content)
         attempts = 0
         max_repairs = max(0, int(self.config.get("llm", {}).get("structured_repair_attempts", 1)))
         while True:
@@ -155,15 +187,57 @@ class BaseAgent:
                     extract_json_with_nonempty_array(result.content, required_nonempty_array)
                     if required_nonempty_array else extract_json(result.content)
                 )
+                if required_nonempty_array:
+                    required_value = parsed.get(required_nonempty_array)
+                    if not isinstance(required_value, list) or not required_value:
+                        raise AgentOutputError(
+                            f"JSON response must contain a non-empty '{required_nonempty_array}' array"
+                        )
+                self.runtime._emit(
+                    "structured_output_parsed", agent=self.name, schema_name=schema_name or f"forge_{self.name}_response",
+                    response_chars=len(result.content), responses_seen=len(response_attempts),
+                )
                 return parsed, result
             except AgentOutputError as exc:
+                truncated = str(getattr(result, "finish_reason", "") or "").lower() in {"length", "max_tokens", "max_output_tokens"}
+                if truncated:
+                    exc = AgentOutputError(f"response truncated at the output limit ({exc})")
                 if attempts >= max_repairs:
-                    raise AgentOutputError(f"{self.name} returned invalid structured output after {attempts + 1} response(s): {exc}") from exc
+                    raise PatchParseError(
+                        f"{self.name} returned invalid structured output after {attempts + 1} response(s): {exc}",
+                        raw_content=result.content,
+                        raw_attempts=response_attempts,
+                    ) from exc
                 attempts += 1
                 self.logger.warning("Invalid agent JSON; requesting structured repair", extra={"agent": self.name, "repair_attempt": attempts})
-                self.runtime._emit("structured_output_repair", agent=self.name, attempt=attempts, error=str(exc))
-                repair_messages = messages + [
-                    {"role": "assistant", "content": result.content},
-                    {"role": "user", "content": "Your previous response was not valid JSON. Return the same intended result as one valid JSON object only. Do not use markdown fences or comments. Escape newlines inside string values."},
-                ]
-                result = self.runtime.complete(self.name, repair_messages, image_paths=image_paths, profile_override=profile_override)
+                self.runtime._emit(
+                    "structured_output_repair", agent=self.name, attempt=attempts, stage=stage_hint,
+                    error=str(exc), response_chars=len(result.content),
+                )
+                repair_instruction = (
+                    "Your previous response was not valid JSON. Return the same intended result as one valid JSON object only. "
+                    "Do not use markdown fences or comments. Escape newlines inside string values."
+                )
+                if required_nonempty_array:
+                    repair_instruction = (
+                        "Your previous response did not satisfy the structured-output contract: "
+                        f"the top-level '{required_nonempty_array}' field must be a non-empty {required_nonempty_array} array. "
+                        "Return one corrected JSON object with real, actionable entries. Do not add a placeholder or no-op "
+                        "merely to satisfy the schema. Keep paths project-relative and preserve the requested contract."
+                    )
+                if truncated:
+                    # Don't feed the cut-off reply back; give the model room to finish instead.
+                    effective_profile = dict(effective_profile or {})
+                    current_cap = int(effective_profile.get("max_output_tokens") or 4096)
+                    effective_profile["max_output_tokens"] = min(32000, int(current_cap * 1.75))
+                    repair_messages = messages + [{"role": "user", "content": (
+                        "Your previous response was cut off by the output limit. Return the complete JSON object again, "
+                        "more concisely (shorter descriptions, fewer words in every string)."
+                    )}]
+                else:
+                    repair_messages = messages + [
+                        {"role": "assistant", "content": result.content},
+                        {"role": "user", "content": repair_instruction},
+                    ]
+                result = self.runtime.complete(self.name, repair_messages, image_paths=image_paths, profile_override=effective_profile)
+                response_attempts.append(result.content)

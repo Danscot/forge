@@ -114,8 +114,8 @@ class FileOps:
     def apply_operations(self, operations: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Validate all patch operations in memory, then atomically write the complete set.
 
-        Supported operations are create_file and replace_text. Existing source files are never
-        overwritten wholesale. If validation fails, no changes are written.
+        Supported operations are create_file, replace_text and overwrite_file (explicit whole-file
+        rewrite of a file the approved plan names). If validation fails, no changes are written.
         """
         if not isinstance(operations, list) or not operations:
             raise FileOperationError("Patch plan contains no operations")
@@ -144,6 +144,12 @@ class FileOps:
                 content = operation.get("content")
                 if not isinstance(content, str) or not content.strip():
                     raise FileOperationError(f"create_file requires non-empty content: {raw_path}")
+                working[path] = content
+                reports.append({"type": op_type, "path": str(path.relative_to(self.root)), "bytes": len(content.encode())})
+            elif op_type == "overwrite_file":
+                content = operation.get("content")
+                if not isinstance(content, str) or not content.strip():
+                    raise FileOperationError(f"overwrite_file requires non-empty content: {raw_path}")
                 working[path] = content
                 reports.append({"type": op_type, "path": str(path.relative_to(self.root)), "bytes": len(content.encode())})
             elif op_type == "replace_text":

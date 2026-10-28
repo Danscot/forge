@@ -58,7 +58,7 @@ class ConfigurableAgentHandler(BaseHTTPRequestHandler):
                 content = {"summary": "Nothing to do", "risk": "low", "files_to_read": [], "operations": [], "validation_plan": [], "registry_changes": []}
             elif mode == "retry_repair":
                 user_message = request["messages"][-1]["content"]
-                source_is_present = "--- src/screens/HomeScreen.tsx ---" in user_message and "<Text>Home</Text>" in user_message
+                source_is_present = "--- src/screens/HomeScreen.tsx" in user_message and "<Text>Home</Text>" in user_message
                 self.config.setdefault("retry_plan_saw_source", []).append(source_is_present)
                 if source_is_present:
                     content = {
@@ -94,7 +94,10 @@ class ConfigurableAgentHandler(BaseHTTPRequestHandler):
                 else:
                     content = {
                         "summary": "Created a basic home screen",
-                        "operations": [{"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"}],
+                        "operations": [
+                            {"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"},
+                            {"type": "overwrite_file", "path": "App.tsx", "content": "import React from 'react';\nimport HomeScreen from './src/screens/HomeScreen';\nexport default function App() { return <HomeScreen />; }\n"},
+                        ],
                         "registry_changes": [],
                     }
             elif mode == "malformed_patch":
@@ -106,7 +109,10 @@ class ConfigurableAgentHandler(BaseHTTPRequestHandler):
             else:
                 content = {
                     "summary": "Created a basic home screen",
-                    "operations": [{"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"}],
+                    "operations": [
+                        {"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"},
+                        {"type": "overwrite_file", "path": "App.tsx", "content": "import React from 'react';\nimport HomeScreen from './src/screens/HomeScreen';\nexport default function App() { return <HomeScreen />; }\n"},
+                    ],
                     "registry_changes": [],
                 }
         elif "rigorous QA critic" in system:

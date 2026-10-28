@@ -102,6 +102,10 @@ llm:
     nvidia:
       base_url: "https://integrate.api.nvidia.com/v1"
       api_key_env: "NVIDIA_API_KEY"
+      # Use the complete OpenAI-compatible json_schema envelope. Older configs that
+      # say structured_output_format: "nvidia" remain supported as an alias.
+      structured_output: true
+      structured_output_format: "openai"
       extra_headers: {}
       static_request_params:
         stream_options:

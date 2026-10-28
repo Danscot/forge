@@ -43,7 +43,10 @@ class AgentHandler(BaseHTTPRequestHandler):
         elif "patch author" in system:
             content = {
                 "summary": "Created a basic home screen",
-                "operations": [{"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"}],
+                "operations": [
+                    {"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"},
+                    {"type": "overwrite_file", "path": "App.tsx", "content": "import React from 'react';\nimport HomeScreen from './src/screens/HomeScreen';\nexport default function App() { return <HomeScreen />; }\n"},
+                ],
                 "registry_changes": [],
             }
         elif "rigorous QA critic" in system:

@@ -42,7 +42,13 @@ forge_mobile_harness.egg-info/entry_points.txt
 forge_mobile_harness.egg-info/requires.txt
 forge_mobile_harness.egg-info/top_level.txt
 tests/test_coder_patch_contract.py
+tests/test_dashboard_transcript.py
+tests/test_expo_server_identity.py
 tests/test_file_ops.py
 tests/test_llm_runtime.py
+tests/test_pipeline_regression.py
+tests/test_renderer_testid_compat.py
 tests/test_runner_integration.py
 tests/test_state_and_json.py
+tests/test_task_scope_gates.py
+tests/test_truncation_and_unbound.py

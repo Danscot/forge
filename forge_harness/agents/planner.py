@@ -11,6 +11,49 @@ from ..tools.file_ops import FileOps
 
 ALLOWED_TASK_TYPES = {"foundation", "design_tokens", "shared_component", "screen", "integration"}
 
+TASK_PLAN_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "app_summary": {"type": "string"},
+        "architecture_notes": {"type": "array", "items": {"type": "string"}},
+        "tasks": {
+            "type": "array", "minItems": 1,
+            "items": {
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "type": {"type": "string", "enum": ["foundation", "design_tokens", "shared_component", "screen", "integration"]},
+                    "title": {"type": "string", "minLength": 1},
+                    "description": {"type": "string"},
+                    "screen": {"type": ["string", "null"]},
+                    "route": {"type": "string"},
+                    "mockup_paths": {"type": "array", "items": {"type": "string"}},
+                    "dependencies": {"type": "array", "items": {"type": "string"}},
+                    "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+                    "test_plan": {
+                        "type": "array", "maxItems": 5,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "action": {"type": "string", "enum": ["assert_visible", "click", "fill", "assert_text", "navigate"]},
+                                "selector": {"type": "string"},
+                                "value": {"type": "string"},
+                                "description": {"type": "string"},
+                            },
+                            "required": ["action", "description"],
+                            "additionalProperties": False,
+                        },
+                    },
+                },
+                "required": ["id", "type", "title", "description"],
+                "additionalProperties": False,
+            },
+        },
+    },
+    "required": ["app_summary", "architecture_notes", "tasks"],
+    "additionalProperties": False,
+}
+
 
 class PlannerAgent(BaseAgent):
     def __init__(self, *args: Any, **kwargs: Any):
@@ -40,7 +83,14 @@ class PlannerAgent(BaseAgent):
             effort_override = {"thinking_enabled": True, "thinking_budget": 1024, "max_output_tokens": 6500}
         elif context_size >= complex_chars or mockup_count >= 5:
             effort_override = {"thinking_enabled": True, "thinking_budget": 3072, "max_output_tokens": 8192}
-        parsed, _result = self.ask_json(user_text, image_paths=images, profile_override=effort_override)
+        parsed, _result = self.ask_json(
+            user_text,
+            image_paths=images,
+            profile_override=effort_override,
+            required_nonempty_array="tasks",
+            json_schema=TASK_PLAN_SCHEMA,
+            schema_name="forge_application_task_plan",
+        )
         raw_tasks = parsed.get("tasks")
         if not isinstance(raw_tasks, list) or not raw_tasks:
             raise AgentOutputError("Planner response must contain a non-empty tasks array")
@@ -70,14 +120,17 @@ class PlannerAgent(BaseAgent):
             # planner output in scope: only screen/integration tasks (or tasks tied to
             # an explicit mockup) may execute browser-level test steps.
             raw_test_plan = [step for step in raw.get("test_plan", []) if isinstance(step, dict)]
+            route = str(raw.get("route") or "/")
             test_plan = raw_test_plan if (task_type in {"screen", "integration"} or mockup_paths) else []
+            if task_type in {"screen", "integration"} or mockup_paths:
+                test_plan = self._ensure_route_activation(route, test_plan)
             task = Task(
                 id=task_id,
                 type=task_type,
                 title=title,
                 description=str(raw.get("description", title)),
                 screen=str(raw.get("screen")) if raw.get("screen") is not None else None,
-                route=str(raw.get("route") or "/"),
+                route=route,
                 mockup_paths=mockup_paths,
                 dependencies=dependencies,
                 acceptance_criteria=[str(v) for v in raw.get("acceptance_criteria", []) if v],
@@ -87,6 +140,33 @@ class PlannerAgent(BaseAgent):
             tasks.append(task)
             known.add(task_id)
         return parsed, tasks
+
+    @staticmethod
+    def _ensure_route_activation(route: str, test_plan: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Prepend a tab-activation step when a non-default route cannot be reached by navigation alone.
+
+        Single-page Expo tab shells ignore the browser route; a Profile task routed to
+        ``/profile`` still renders Home until the Profile tab is clicked. Without an
+        activation step, ``assert_visible`` checks for route-specific selectors time out.
+        """
+        normalized = str(route or "").strip("/")
+        if not normalized:
+            return test_plan
+        segment = normalized.split("/", 1)[0]
+        if not segment:
+            return test_plan
+        has_activation = any(
+            isinstance(step, dict) and str(step.get("action", "")).strip() in {"click", "navigate"}
+            for step in test_plan
+        )
+        if has_activation:
+            return test_plan
+        activation_step = {
+            "action": "click",
+            "selector": f'[data-testid="tab-{segment}"]',
+            "description": f"Activate the {segment} tab for route {route}",
+        }
+        return [activation_step] + list(test_plan)
 
     @staticmethod
     def _project_inventory(file_ops: FileOps) -> str:

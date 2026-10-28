@@ -253,3 +253,44 @@ def test_planner_discards_screen_test_plan_from_non_screen_task(tmp_path: Path):
     assert tasks[1].type == "screen"
     assert len(tasks[1].test_plan) == 1
     assert runtime.profile_overrides[0]["max_output_tokens"] >= 6000
+
+
+def test_application_planner_enables_nonempty_task_json_schema(tmp_path):
+    import json
+    from forge_harness.agents.planner import PlannerAgent
+    from forge_harness.tools.file_ops import FileOps
+
+    class FakeRuntime:
+        def __init__(self):
+            self.calls = []
+
+        def complete(self, agent, messages, **kwargs):
+            self.calls.append({"agent": agent, "messages": messages, "kwargs": kwargs})
+            result = {
+                "app_summary": "Small learning app",
+                "architecture_notes": [],
+                "tasks": [{"id": "home", "type": "screen", "title": "Home", "description": "Build home screen", "route": "/", "mockup_paths": [], "dependencies": [], "acceptance_criteria": ["Home heading is visible"], "test_plan": []}],
+            }
+            return type("Result", (), {"content": json.dumps(result)})()
+
+        def _emit(self, *args, **kwargs):
+            return None
+
+    runtime = FakeRuntime()
+    config = {
+        "project": {"harness_dir": ".harness"},
+        "llm": {
+            "default_provider": "nvidia",
+            "providers": {"nvidia": {"base_url": "https://integrate.api.nvidia.com/v1"}},
+            "agents": {"planner": {"model": "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"}},
+            "effort_policy": {"planner_thresholds": {"simple_context_chars": 12000, "complex_context_chars": 30000}},
+        },
+    }
+    agent = PlannerAgent(runtime, tmp_path, config)
+    _, tasks = agent.plan("Build a small learning app", {"mockups": [], "assets": []}, FileOps(tmp_path))
+
+    assert len(tasks) == 1
+    profile = runtime.calls[0]["kwargs"]["profile_override"]
+    schema = profile["structured_output_schema"]["schema"]
+    assert "tasks" in schema["required"]
+    assert schema["properties"]["tasks"]["minItems"] == 1

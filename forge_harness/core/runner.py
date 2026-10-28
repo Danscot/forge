@@ -305,6 +305,16 @@ class HarnessRunner:
                         registry_snapshot = self.registry.refresh(patch.get("registry_changes", []))
                         self._save_patch_summary(task_dir, attempt_index, apply_results, approved_plan, patch)
 
+                        # Restart the Expo server so Metro re-bundles with the latest
+                        # source changes. Without this, the server serves a stale bundle
+                        # and functional checks fail even though type-check passes.
+                        if self._server:
+                            try:
+                                self._server.restart()
+                                self.dashboard.activity_message("PASS", "Expo server restarted to pick up source changes")
+                            except Exception as restart_exc:
+                                self.logger.warning("Expo server restart failed: %s", restart_exc)
+
                         self._set_stage(ExecutionStage.RUNNING_TYPE_CHECKS)
                         typecheck = self._run_typecheck()
                         self.dashboard.set_validation("TypeScript", "PASS" if typecheck.get("passed") else "FAIL")
@@ -449,7 +459,7 @@ class HarnessRunner:
                         else:
                             self.dashboard.activity_message("WARN", f"{task.title} failed validation; preparing a targeted repair")
                             try:
-                                diagnosis = diagnostic_agent.diagnose(task, evidence, approved_plan)
+                                diagnosis = diagnostic_agent.diagnose(task, evidence, approved_plan, file_ops=self.file_ops)
                             except Exception as diagnostic_exc:
                                 diagnosis = self._fallback_diagnosis(evidence, str(diagnostic_exc))
                                 self.dashboard.activity_message("WARN", "Diagnostic agent unavailable; using deterministic compiler/runtime summary")

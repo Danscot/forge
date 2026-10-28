@@ -207,3 +207,20 @@ python -m compileall -q forge_harness
 ```
 
 Contributions should keep LLM request behavior centralized, tunables configurable, file changes narrowly scoped, and the CLI useful during both successful and failed runs.
+
+
+## Structured output contracts
+
+Coder planning and patch-generation calls, plus the top-level task planner, attach a JSON Schema contract when the selected endpoint supports constrained outputs. For NVIDIA's hosted Chat Completions endpoint, FORGE uses the documented `response_format.json_schema.schema` form and requires non-empty `operations` or `tasks` arrays. Python still validates every path, anchor, operation type, and approved-plan match before any file is changed; the provider schema does not replace those safety checks.
+
+The NVIDIA provider is enabled by default. For another compatible endpoint, enable structured outputs only when the selected model supports the schema dialect, for example:
+
+```yaml
+llm:
+  providers:
+    openai:
+      structured_output: true
+      structured_output_format: openai
+```
+
+Provider-neutral schemas are translated at request time, so a configured fallback provider gets its own response-format shape. If a provider is not enabled for structured output, FORGE retains its local parsing, schema repair, and safety validation instead of sending an unsupported request parameter. Failed structured responses are persisted as raw response artifacts for diagnosis.

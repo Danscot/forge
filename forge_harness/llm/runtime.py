@@ -222,7 +222,10 @@ class LLMRuntime:
                 seen.add(key)
         return result
 
-    def _build_payload(self, provider_name: str, model_name: str, profile: dict[str, Any], messages: list[dict[str, Any]], stream: bool) -> dict[str, Any]:
+    def _build_payload(
+        self, provider_name: str, model_name: str, profile: dict[str, Any],
+        messages: list[dict[str, Any]], stream: bool, *, agent: str | None = None,
+    ) -> dict[str, Any]:
         provider_cfg = self.llm_cfg.get("providers", {}).get(provider_name)
         if not isinstance(provider_cfg, dict):
             raise LLMError(f"Provider '{provider_name}' is not configured under llm.providers", fatal=True)
@@ -257,6 +260,43 @@ class LLMRuntime:
         if not isinstance(custom, dict):
             raise LLMError("Agent request_params must be a mapping", fatal=True)
         payload = _deep_merge_dicts(payload, custom)
+
+        # Keep the agent's schema provider-neutral until this point. If the primary
+        # provider fails and a fallback model is selected, each candidate gets the
+        # response_format dialect configured for that provider instead of reusing a
+        # provider-specific payload from the original model.
+        structured_spec = profile.get("structured_output_schema")
+        agent_name = agent or str(profile.get("agent_name") or "unknown")
+        if isinstance(structured_spec, dict) and isinstance(structured_spec.get("schema"), dict):
+            enabled = provider_cfg.get("structured_output", provider_name == "nvidia")
+            if enabled:
+                schema = structured_spec["schema"]
+                schema_name = str(structured_spec.get("name") or f"forge_{agent_name}_response")
+                format_style = str(provider_cfg.get("structured_output_format") or ("nvidia" if provider_name == "nvidia" else "openai")).lower()
+                # The hosted NVIDIA Chat Completions endpoint is OpenAI-compatible,
+                # and validates response_format as a discriminated object. Omitting its
+                # top-level `type` field produces HTTP 400: "missing field `type`".
+                # Keep `nvidia` as a configuration alias for backwards compatibility,
+                # but always send the complete json_schema envelope.
+                payload["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {"name": schema_name, "schema": schema},
+                }
+                self._emit(
+                    "structured_output_constraint_enabled",
+                    agent=agent_name,
+                    provider=provider_name,
+                    schema_name=schema_name,
+                    schema_required=list(schema.get("required", [])),
+                )
+            else:
+                self._emit(
+                    "structured_output_constraint_skipped",
+                    agent=agent_name,
+                    provider=provider_name,
+                    schema_name=str(structured_spec.get("name") or f"forge_{agent_name}_response"),
+                    reason="provider_structured_output_not_enabled",
+                )
         return payload
 
     def _messages_with_images(self, messages: list[dict[str, Any]], image_paths: list[str | Path] | None) -> list[dict[str, Any]]:
@@ -356,7 +396,7 @@ class LLMRuntime:
             raise LLMError(f"Provider '{provider}' has no base_url", fatal=True, provider=provider)
         url = f"{base_url}/chat/completions"
         stream = bool(profile.get("streaming", self.llm_cfg.get("streaming", True)))
-        payload = self._build_payload(provider, model, profile, messages, stream)
+        payload = self._build_payload(provider, model, profile, messages, stream, agent=agent)
         if bool(self.llm_cfg.get("log_payloads", False)) or bool(self.config.get("logging", {}).get("capture_payloads", False)):
             limit = max(500, int(self.llm_cfg.get("log_payload_char_limit", 5000)))
             request_preview = json.dumps(payload, ensure_ascii=False, default=str)

@@ -52,6 +52,25 @@ def test_foundation_task_does_not_fail_because_future_screen_is_not_composed():
     assert report["rejection_reasons"] == []
 
 
+def test_foundation_with_misassigned_mockup_does_not_require_screen_gates():
+    """A whole-page mockup accidentally assigned to foundation must not block the queue."""
+    typecheck = {"passed": True}
+    render = {
+        "page_errors": [],
+        "functional_pass": False,
+        "test_results": [],
+        "console_errors": [],
+    }
+    report = _runner()._evaluate_gates(
+        typecheck, render, None, None, {}, has_mockup=True, task_type="foundation"
+    )
+    assert report["accepted"] is True
+    assert report["functional_gate_required"] is False
+    assert report["visual_gate_required"] is False
+    assert report["functional_pass"] is True
+    assert report["quality_score"] == 100
+
+
 def test_screen_task_still_requires_visual_critic():
     typecheck, render = _passing_technical_evidence()
     report = _runner()._evaluate_gates(
@@ -145,6 +164,10 @@ def test_visual_review_scope_is_limited_to_screen_integration_or_mockup():
 
     runner = _runner()
     foundation = Task(id="foundation", type="foundation", title="Tokens", description="Create tokens")
+    foundation_with_mockup = Task(
+        id="foundation_mockup", type="foundation", title="Tokens",
+        description="Create tokens", mockup_paths=["input/mockups/home.png"],
+    )
     shared = Task(id="shared", type="shared_component", title="Card", description="Create card")
     screen = Task(id="home", type="screen", title="Home", description="Build screen")
     mockup_component = Task(
@@ -152,6 +175,9 @@ def test_visual_review_scope_is_limited_to_screen_integration_or_mockup():
         description="Implement card", mockup_paths=["input/mockups/card.png"],
     )
     assert runner._requires_visual_review(foundation) is False
+    assert runner._requires_visual_review(foundation_with_mockup) is False
+    assert runner._requires_functional_review(foundation_with_mockup) is False
+    assert runner._effective_test_plan(foundation_with_mockup) == []
     assert runner._requires_visual_review(shared) is False
     assert runner._requires_visual_review(screen) is True
     assert runner._requires_visual_review(mockup_component) is True
@@ -253,6 +279,52 @@ def test_planner_discards_screen_test_plan_from_non_screen_task(tmp_path: Path):
     assert tasks[1].type == "screen"
     assert len(tasks[1].test_plan) == 1
     assert runtime.profile_overrides[0]["max_output_tokens"] >= 6000
+
+
+def test_planner_moves_whole_screen_mockup_off_foundation_task(tmp_path: Path):
+    import json
+    from forge_harness.agents.planner import PlannerAgent
+
+    class FakeRuntime:
+        def complete(self, agent, messages, **kwargs):
+            content = {
+                "app_summary": "LearnHub",
+                "architecture_notes": [],
+                "tasks": [
+                    {
+                        "id": "foundation", "type": "foundation", "title": "Foundation",
+                        "description": "Create theme and root shell",
+                        "mockup_paths": ["input/mockups/1.png"],
+                        "test_plan": [{"action": "assert_visible", "selector": "[data-testid=\"home-heading\"]", "description": "Home heading"}],
+                    },
+                    {
+                        "id": "home", "type": "screen", "title": "Home",
+                        "description": "Implement the Home screen", "screen": "Home",
+                        "mockup_paths": [], "test_plan": [
+                            {"action": "assert_visible", "selector": "[data-testid=\"home-heading\"]", "description": "Home heading"}
+                        ],
+                    },
+                ],
+            }
+            return type("Result", (), {"content": json.dumps(content), "usage": {}, "finish_reason": "stop"})()
+
+        def _emit(self, *args, **kwargs):
+            return None
+
+    root = tmp_path / "project"
+    mockup = root / "input" / "mockups" / "1.png"
+    mockup.parent.mkdir(parents=True)
+    mockup.write_bytes(b"mockup placeholder")
+    agent = PlannerAgent(FakeRuntime(), root, {"llm": {"structured_repair_attempts": 0}})
+    manifest = {"mockups": [{"path": "input/mockups/1.png", "name": "1.png"}], "assets": []}
+    _, tasks = agent.plan("Reproduce the reference UI", manifest, FileOps(root))
+
+    assert tasks[0].type == "foundation"
+    assert tasks[0].mockup_paths == []
+    assert tasks[0].test_plan == []
+    assert tasks[1].type == "screen"
+    assert tasks[1].mockup_paths == ["input/mockups/1.png"]
+    assert len(tasks[1].test_plan) == 1
 
 
 def test_application_planner_enables_nonempty_task_json_schema(tmp_path):

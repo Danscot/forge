@@ -697,20 +697,29 @@ class HarnessRunner:
 
     @staticmethod
     def _requires_visual_review(task: Task) -> bool:
-        """Visual acceptance belongs to screen/integration tasks or an explicit mockup."""
+        """Require page-level visual acceptance only when this task owns that UI.
+
+        A whole-page mockup is often included in the run manifest and may be
+        mistakenly attached to a foundation task by the master planner. That must
+        not cause an incomplete root shell to be judged as the final screen.
+        Explicit mockup-driven shared components may still request visual review.
+        """
         task_type = str(task.type or "").strip().lower()
-        return bool(task.mockup_paths) or task_type in {"screen", "integration"}
+        return task_type in {"screen", "integration"} or (
+            task_type == "shared_component" and bool(task.mockup_paths)
+        )
 
     @staticmethod
     def _requires_functional_review(task: Task) -> bool:
-        """Browser interaction assertions are scoped to a screen, integration, or mockup.
+        """Run screen selectors only for screen/integration or focused mockup components.
 
-        Foundation/design-token/shared-component tasks may smoke-render the existing
-        application, but must not be forced to satisfy screen-level selectors before a
-        later task mounts those components.
+        Foundation/design-token tasks may smoke-render the application, but must not
+        be forced to satisfy controls/selectors that a later screen task will add.
         """
         task_type = str(task.type or "").strip().lower()
-        return bool(task.mockup_paths) or task_type in {"screen", "integration"}
+        return task_type in {"screen", "integration"} or (
+            task_type == "shared_component" and bool(task.mockup_paths)
+        )
 
     @classmethod
     def _effective_test_plan(cls, task: Task) -> list[dict[str, Any]]:
@@ -733,7 +742,12 @@ class HarnessRunner:
         if cfg.get("require_runtime_render", True) and not render:
             render_pass = False
         task_type = str(task_type or "").strip().lower()
-        functional_gate_required = bool(task_type in {"screen", "integration"} or has_mockup)
+        # `has_mockup` alone is not enough to make a foundation task responsible for
+        # the page: planner output can accidentally attach the same reference to both
+        # foundation and screen tasks. Keep full interaction acceptance scoped to the
+        # task that owns the screen (or an explicitly mockup-driven shared component).
+        mockup_component_scope = task_type == "shared_component" and has_mockup
+        functional_gate_required = bool(task_type in {"screen", "integration"} or mockup_component_scope)
         task_tests = (render or {}).get("test_results", [])
         task_tests_pass = all(item.get("passed", False) for item in task_tests)
         custom_pass = custom_functional is None or bool(custom_functional.get("passed"))
@@ -756,7 +770,7 @@ class HarnessRunner:
         # is not valid evidence that the shared-component task failed.
         visual_gate_required = bool(
             task_type in {"screen", "integration"}
-            or (has_mockup and cfg.get("require_visual_critic_when_mockup_exists", True))
+            or (mockup_component_scope and cfg.get("require_visual_critic_when_mockup_exists", True))
         )
         weights = cfg.get("functional_weight", 0.6), cfg.get("visual_weight", 0.4)
         functional_score = float((critic or {}).get("functional_score", 100 if functional_pass else 0))

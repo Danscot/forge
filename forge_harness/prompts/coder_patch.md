@@ -17,3 +17,6 @@ Rules:
 - Add accessible labels to interactive controls; use stable testIDs for key interactions where practical.
 - Make the smallest code change that satisfies acceptance criteria and prior diagnostics.
 - Return no markdown fences.
+- Emit exactly one JSON object with a non-empty operations array. Do not include analysis or prose before or after it.
+- Return exactly one patch operation for every approved operation, using the same type and path. Never invent operations or omit approved ones.
+- Keep generated implementations concise but complete; avoid unnecessary comments and unrelated abstractions.

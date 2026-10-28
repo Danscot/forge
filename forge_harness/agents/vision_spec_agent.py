@@ -29,7 +29,16 @@ class VisionSpecAgent(BaseAgent):
             f"EXISTING COMPONENT REGISTRY:\n{json.dumps(registry, ensure_ascii=False, indent=2)[:10000]}\n\n"
             "Inspect the image(s), then create a precise React Native-compatible implementation specification."
         )
-        parsed, _result = self.ask_json(user_text, image_paths=[str(file_ops.resolve(item["path"])) for item in inventory])
+        image_paths = [str(file_ops.resolve(item["path"])) for item in inventory]
+        # One reference needs only a compact extraction pass; multiple mockups require
+        # more effort to reconcile shared tokens and layout differences.
+        if len(image_paths) <= 1:
+            vision_effort = {"thinking_enabled": True, "thinking_budget": 512, "max_output_tokens": 3000}
+        elif len(image_paths) >= 5:
+            vision_effort = {"thinking_enabled": True, "thinking_budget": 1536, "max_output_tokens": 5000}
+        else:
+            vision_effort = {"thinking_enabled": True, "thinking_budget": 768, "max_output_tokens": 4000}
+        parsed, _result = self.ask_json(user_text, image_paths=image_paths, profile_override=vision_effort)
         if not any(key in parsed for key in ("layout", "regions", "design_tokens")):
             raise AgentOutputError("Vision specification is missing layout information")
         return parsed

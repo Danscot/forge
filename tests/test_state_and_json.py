@@ -21,3 +21,10 @@ def test_state_store_persists_run_and_tasks(tmp_path: Path):
     assert loaded["tasks"][0]["id"] == "home"
     store.update_task("run1", {**task, "status": "passed", "last_report": {"accepted": True}}, 0)
     assert store.get_run("run1")["tasks"][0]["status"] == "passed"
+
+
+def test_extract_json_skips_unrelated_braced_preamble():
+    from forge_harness.agents.base import extract_json
+
+    parsed = extract_json('Notice {not json} then {"operations": [{"type": "create_file"}]}')
+    assert parsed["operations"][0]["type"] == "create_file"

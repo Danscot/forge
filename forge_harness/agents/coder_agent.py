@@ -42,9 +42,61 @@ class CoderAgent(BaseAgent):
             f"PRIOR DIAGNOSTICS:\n{json.dumps(diagnostics or {}, ensure_ascii=False, indent=2)[:9000]}\n\n"
             "Plan the smallest sufficient set of changes. Do not author implementation code in this response."
         )
-        parsed, _result = self.ask_json(user_text)
-        self._validate_plan(parsed, file_ops)
-        return parsed
+        # This is a surgical operation plan under a task that has already been
+        # decomposed by PlannerAgent. Keep it direct and bounded; implementation code
+        # is generated in the separate patch stage.
+        plan_effort = (self.config.get("llm", {}).get("effort_policy", {}) or {}).get("coder_plan", {})
+        profile_override = {
+            "thinking_enabled": bool(plan_effort.get("thinking_enabled", False)),
+            "max_output_tokens": max(1200, int(plan_effort.get("max_output_tokens", 3500))),
+        }
+        if plan_effort.get("thinking_budget") is not None:
+            profile_override["thinking_budget"] = max(0, int(plan_effort["thinking_budget"]))
+        parsed, result = self.ask_json(
+            user_text,
+            profile_override=profile_override,
+            required_nonempty_array="operations",
+        )
+        # JSON can parse successfully while still violating the plan contract (for
+        # example, an empty operations array). Repair that schema failure locally
+        # instead of burning a complete task retry and repeating the same planning
+        # work. The retry remains bounded and still passes through the same validator.
+        max_plan_repairs = max(0, int(self.config.get("llm", {}).get("structured_repair_attempts", 1)))
+        for repair_index in range(max_plan_repairs + 1):
+            try:
+                self._validate_plan(parsed, file_ops)
+                return parsed
+            except AgentOutputError as exc:
+                if repair_index >= max_plan_repairs:
+                    raise
+                self.runtime._emit(
+                    "structured_output_repair",
+                    agent="coder",
+                    stage="planning_changes",
+                    attempt=repair_index + 1,
+                    error=str(exc),
+                )
+                repair_messages = [
+                    {"role": "system", "content": self._prompt_for(self.prompt_name)},
+                    {"role": "user", "content": user_text},
+                    {"role": "assistant", "content": result.content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous response was valid JSON but failed the plan contract: "
+                            f"{exc}. Return a corrected JSON object with a non-empty operations array "
+                            "that addresses the task and any confirmed prior diagnostics. Every operation "
+                            "must make a meaningful content change; do not invent a touch operation, a "
+                            "same-text replacement, or another no-op just to satisfy the schema. If the "
+                            "task needs more work, identify the smallest real change that satisfies its "
+                            "acceptance criteria. Preserve the required schema, use only project-relative "
+                            "paths, and do not include code."
+                        ),
+                    },
+                ]
+                result = self.runtime.complete("coder", repair_messages, profile_override=profile_override)
+                parsed = self._extract_contract_candidates(result.content, "operations")[0]
+        return parsed  # pragma: no cover - the bounded loop returns or raises
 
     def generate_patch(
         self,
@@ -65,18 +117,163 @@ class CoderAgent(BaseAgent):
             f"LATEST DIAGNOSTICS:\n{json.dumps(diagnostics or {}, ensure_ascii=False, indent=2)[:9000]}\n\n"
             "Generate the code patch operations now. You must stay within the approved paths and operation types."
         )
-        messages = [{"role": "system", "content": self._prompt_for(self.patch_prompt_name)}, {"role": "user", "content": user_text}]
-        result = self.runtime.complete("coder", messages)
-        try:
-            from .base import extract_json, PatchParseError
-            parsed = extract_json(result.content)
-        except AgentOutputError as exc:
-            raise PatchParseError(f"Coder did not return a patch JSON object: {exc}", raw_content=result.content) from exc
-        operations = parsed.get("operations")
-        if not isinstance(operations, list) or not operations:
-            raise AgentOutputError("Coder patch response has no operations")
-        self._validate_patch_against_plan(operations, approved_plan, file_ops)
-        return parsed
+        base_messages = [
+            {"role": "system", "content": self._prompt_for(self.patch_prompt_name)},
+            {"role": "user", "content": user_text},
+        ]
+        messages = list(base_messages)
+        llm_cfg = self.config.get("llm", {})
+        patch_cfg = llm_cfg.get("patch_generation", {}) or {}
+        max_repairs = max(0, int(patch_cfg.get("structured_repair_attempts", llm_cfg.get("structured_repair_attempts", 1))))
+        # Patch output is tightly constrained by the approved plan. Reasoning tokens
+        # on this stage add latency and can bury the JSON payload, so use the provider's
+        # configured thinking switch off by default. Set llm.patch_generation.thinking_enabled
+        # to true to opt back in for models that benefit from it.
+        profile_override: dict[str, Any] = {
+            "thinking_enabled": bool(patch_cfg.get("thinking_enabled", False)),
+        }
+        if patch_cfg.get("thinking_budget") is not None:
+            profile_override["thinking_budget"] = max(0, int(patch_cfg["thinking_budget"]))
+        if patch_cfg.get("max_output_tokens") is not None:
+            # An explicit patch cap is a user-requested hard limit.
+            profile_override["max_output_tokens"] = max(1024, int(patch_cfg["max_output_tokens"]))
+        else:
+            # Estimate output allowance from approved operations rather than giving a
+            # one-file patch the same budget as a foundation task with many components.
+            # This scales output capacity without raising reasoning effort.
+            configured_cap = (
+                (llm_cfg.get("effort_policy", {}) or {}).get("agents", {}).get("coder", {}).get("max_output_tokens")
+                or llm_cfg.get("agents", {}).get("coder", {}).get("max_output_tokens")
+                or 12000
+            )
+            hard_cap = max(2500, int(configured_cap))
+            planned_operations = approved_plan.get("operations", []) or []
+            create_count = sum(1 for op in planned_operations if op.get("type") == "create_file")
+            replace_count = sum(1 for op in planned_operations if op.get("type") == "replace_text")
+            estimated_budget = 1000 + (1850 * create_count) + (1250 * replace_count)
+            profile_override["max_output_tokens"] = min(hard_cap, max(2500, estimated_budget))
+        response_attempts: list[str] = []
+        last_error: AgentOutputError | None = None
+
+        for repair_index in range(max_repairs + 1):
+            result = self.runtime.complete("coder", messages, profile_override=profile_override)
+            response_attempts.append(result.content)
+            try:
+                from .base import PatchParseError, extract_json_candidates
+                parsed_candidates = self._extract_contract_candidates(result.content, "operations")
+                if not parsed_candidates:
+                    json_candidates = extract_json_candidates(result.content)
+                    first_keys = sorted(json_candidates[0].keys()) if json_candidates else []
+                    raise AgentOutputError(
+                        "Coder patch response did not contain a non-empty operations array "
+                        f"(JSON candidates={len(json_candidates)}, first candidate keys={first_keys}, "
+                        f"response_chars={len(result.content)})"
+                    )
+
+                candidate_errors: list[AgentOutputError] = []
+                for parsed in parsed_candidates:
+                    operations = parsed.get("operations")
+                    if not isinstance(operations, list) or not operations:
+                        continue
+                    try:
+                        self._validate_patch_against_plan(operations, approved_plan, file_ops)
+                    except (AgentOutputError, FileOperationError) as candidate_exc:
+                        candidate_errors.append(
+                            candidate_exc if isinstance(candidate_exc, AgentOutputError)
+                            else AgentOutputError(str(candidate_exc))
+                        )
+                        continue
+                    # Select a candidate only after it both has operations and passes
+                    # the exact approved-plan/path/anchor contract.
+                    return parsed
+
+                if candidate_errors:
+                    # A later JSON candidate may be a valid implementation while an
+                    # earlier one is a stub or embedded example. Keep checking all
+                    # candidates; if none match the plan, repair using the last precise
+                    # validation error rather than incorrectly reporting an empty array.
+                    raise candidate_errors[-1]
+                raise AgentOutputError("Coder patch response has no non-empty operations array")
+            except (AgentOutputError, FileOperationError) as exc:
+                # Schema/plan/path validation failures are still patch-authoring failures;
+                # attempt a constrained correction before restarting the entire task.
+                last_error = exc if isinstance(exc, AgentOutputError) else AgentOutputError(str(exc))
+                if repair_index >= max_repairs:
+                    raise PatchParseError(
+                        f"Coder patch response remained invalid after {repair_index + 1} response(s): {exc}",
+                        raw_content=result.content,
+                        raw_attempts=response_attempts,
+                    ) from exc
+
+                # Repair the patch response in-place rather than burning a complete
+                # task retry (which repeats planning, diagnosis, and full code generation).
+                # Keep the original approved plan and give the model the deterministic
+                # validation error so it can return a corrected JSON patch only.
+                self.runtime._emit(
+                    "structured_output_repair",
+                    agent="coder",
+                    attempt=repair_index + 1,
+                    error=str(exc),
+                )
+                messages = base_messages + [
+                    {"role": "assistant", "content": result.content},
+                    {
+                        "role": "user",
+                        "content": (
+                            "Your previous patch response was rejected. Correct it and return one valid JSON object only. "
+                            "Do not change the approved plan, add unplanned paths, or omit any approved operation. "
+                            "Preserve the required patch schema. Validation error: " + str(exc)
+                        ),
+                    },
+                ]
+
+        # The loop always returns or raises; this is a defensive invariant.
+        raise PatchParseError(
+            f"Coder patch generation failed: {last_error or 'unknown error'}",
+            raw_content=response_attempts[-1] if response_attempts else "",
+            raw_attempts=response_attempts,
+        )
+
+    @staticmethod
+    def _extract_contract_candidates(text: str, required_array: str) -> list[dict[str, Any]]:
+        """Return schema-shaped JSON candidates, prioritizing non-empty arrays.
+
+        Do not assume the first decodable object is the final answer. Keep all
+        candidates with a non-empty operations array so the caller can test each
+        one against the approved operation plan before selecting it.
+        """
+        from .base import extract_json_candidates
+
+        candidates = extract_json_candidates(text)
+        if not candidates:
+            from .base import extract_json
+            return [extract_json(text)]
+
+        normalized: list[dict[str, Any]] = []
+        for candidate in candidates:
+            item = dict(candidate)
+            value = item.get(required_array)
+            if not isinstance(value, list) or not value:
+                for wrapper_key in ("patch", "plan", "result", "data"):
+                    wrapped = item.get(wrapper_key)
+                    if not isinstance(wrapped, dict):
+                        continue
+                    wrapped_value = wrapped.get(required_array)
+                    if isinstance(wrapped_value, list) and wrapped_value:
+                        item[required_array] = wrapped_value
+                        for metadata_key in ("summary", "registry_changes", "files_to_read", "validation_plan", "risk"):
+                            if metadata_key not in item and metadata_key in wrapped:
+                                item[metadata_key] = wrapped[metadata_key]
+                        break
+            normalized.append(item)
+
+        matching = [
+            item for item in normalized
+            if isinstance(item.get(required_array), list) and bool(item[required_array])
+        ]
+        # If no candidates satisfy the minimum schema, return the first candidate
+        # so the caller can issue a bounded repair with a precise contract error.
+        return matching or normalized[:1]
 
     def apply_patch(self, patch: dict[str, Any], file_ops: FileOps) -> list[dict[str, Any]]:
         return file_ops.apply_operations(patch.get("operations", []))
@@ -101,6 +298,11 @@ class CoderAgent(BaseAgent):
             if operation_type == "create_file" and target.exists():
                 raise AgentOutputError(f"Plan attempts to create an existing file: {path}")
             if operation_type == "replace_text":
+                proposed_new_text = operation.get("new_text")
+                if not isinstance(proposed_new_text, str):
+                    raise AgentOutputError(f"replace_text needs a string new_text replacement: {path}")
+                if proposed_new_text == operation.get("old_text"):
+                    raise AgentOutputError(f"No-op replace_text is not allowed; operation must change file content: {path}")
                 if not target.is_file():
                     # After a snapshot restore, files created in earlier attempts no longer exist.
                     # Rather than hard-failing the plan, auto-upgrade replace_text → create_file so
@@ -141,6 +343,8 @@ class CoderAgent(BaseAgent):
             if op_type == "replace_text":
                 if not isinstance(operation.get("new_text"), str):
                     raise AgentOutputError(f"replace_text requires string new_text: {op_path}")
+                if operation.get("new_text") == op_old_text:
+                    raise AgentOutputError(f"No-op replace_text is not allowed; operation must change file content: {op_path}")
                 target = file_ops.resolve(op_path, for_write=True)
                 # Use the plan's anchor for the uniqueness check: _validate_plan already
                 # confirmed it exists exactly once in the current file. The patch's anchor

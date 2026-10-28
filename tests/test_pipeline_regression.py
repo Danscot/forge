@@ -31,6 +31,8 @@ class ConfigurableAgentHandler(BaseHTTPRequestHandler):
         request = json.loads(body)
         system = request["messages"][0]["content"] if request.get("messages") else ""
         mode = self.config.get("mode", "success")
+        if mode == "retry_repair":
+            self.config.setdefault("requests", []).append(request)
 
         # Simulate a provider/API exception during a specific agent's call.
         if mode == "llm_error" and "patch author" in system:
@@ -54,6 +56,23 @@ class ConfigurableAgentHandler(BaseHTTPRequestHandler):
         elif "change planner" in system:
             if mode == "empty_plan":
                 content = {"summary": "Nothing to do", "risk": "low", "files_to_read": [], "operations": [], "validation_plan": [], "registry_changes": []}
+            elif mode == "retry_repair":
+                user_message = request["messages"][-1]["content"]
+                source_is_present = "--- src/screens/HomeScreen.tsx ---" in user_message and "<Text>Home</Text>" in user_message
+                self.config.setdefault("retry_plan_saw_source", []).append(source_is_present)
+                if source_is_present:
+                    content = {
+                        "summary": "Repair the existing home screen in place",
+                        "risk": "low", "files_to_read": ["src/screens/HomeScreen.tsx"],
+                        "operations": [{"type": "replace_text", "path": "src/screens/HomeScreen.tsx", "target": "home heading", "reason": "Repair the existing failed attempt", "old_text": "<Text>Home</Text>", "new_text": "<Text>Home repaired</Text>"}],
+                        "validation_plan": ["TypeScript compiles"], "registry_changes": [],
+                    }
+                else:
+                    content = {
+                        "summary": "Create initial home screen", "risk": "low", "files_to_read": [],
+                        "operations": [{"type": "create_file", "path": "src/screens/HomeScreen.tsx", "target": "home screen", "reason": "Create task screen", "content_outline": "A typed React Native screen"}],
+                        "validation_plan": ["TypeScript compiles"], "registry_changes": [],
+                    }
             else:
                 content = {
                     "summary": "Create the initial home screen",
@@ -64,7 +83,21 @@ class ConfigurableAgentHandler(BaseHTTPRequestHandler):
                     "registry_changes": [],
                 }
         elif "patch author" in system:
-            if mode == "malformed_patch":
+            if mode == "retry_repair":
+                user_message = request["messages"][-1]["content"]
+                if '"type": "replace_text"' in user_message:
+                    content = {
+                        "summary": "Repair the existing home screen",
+                        "operations": [{"type": "replace_text", "path": "src/screens/HomeScreen.tsx", "old_text": "<Text>Home</Text>", "new_text": "<Text>Home repaired</Text>"}],
+                        "registry_changes": [],
+                    }
+                else:
+                    content = {
+                        "summary": "Created a basic home screen",
+                        "operations": [{"type": "create_file", "path": "src/screens/HomeScreen.tsx", "content": "import React from 'react';\nimport { View, Text } from 'react-native';\nexport default function HomeScreen() { return <View><Text>Home</Text></View>; }\n"}],
+                        "registry_changes": [],
+                    }
+            elif mode == "malformed_patch":
                 content = "This is not JSON at all, just conversational text."
             elif mode == "empty_patch":
                 content = {"summary": "No ops", "operations": []}
@@ -185,6 +218,42 @@ def test_successful_planning_patch_generation_and_application(monkeypatch, tmp_p
         # Stage transitions should be recorded in the event log.
         events = [e["event_type"] for e in __import__("forge_harness.core.store", fromlist=["StateStore"]).StateStore(project / ".harness" / "state.db").recent_events(result["run_id"])]
         assert "stage" in events, f"No stage events recorded: {events}"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=1)
+
+
+def test_retry_repairs_previous_attempt_without_restoring_task_baseline(monkeypatch, tmp_path: Path):
+    """A targeted repair must see files created by the prior failed validation attempt."""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), ConfigurableAgentHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    monkeypatch.setenv("TEST_FORGE_KEY", "test-key")
+    monkeypatch.setattr("forge_harness.core.runner.ExpoServer", FakeExpoServer)
+    monkeypatch.setattr("forge_harness.core.runner.PlaywrightRenderer", FakeRenderer)
+    checks = {"count": 0}
+
+    def typecheck_fails_once(self):
+        checks["count"] += 1
+        if checks["count"] == 1:
+            return {"passed": False, "exit_code": 2, "stdout": "intentional first-attempt type error", "stderr": "", "command": ["mock-typecheck"], "duration_s": 0.01, "timed_out": False}
+        return {"passed": True, "exit_code": 0, "stdout": "", "stderr": "", "command": ["mock-typecheck"], "duration_s": 0.01, "timed_out": False}
+
+    monkeypatch.setattr(HarnessRunner, "_run_typecheck", typecheck_fails_once)
+    try:
+        project = tmp_path / "expo-app"
+        project.mkdir()
+        (project / "package.json").write_text(json.dumps({"name": "expo-app", "dependencies": {"expo": "1.0.0"}}), encoding="utf-8")
+        (project / "App.tsx").write_text("export default function App() { return null; }\n", encoding="utf-8")
+        initialize_project(project)
+        cfg = _make_config(project, server.server_port, mode="retry_repair")
+        result = _run_harness(project, cfg, monkeypatch=monkeypatch)
+        assert result["status"] == "completed", result
+        assert checks["count"] == 2
+        assert ConfigurableAgentHandler.config.get("retry_plan_saw_source") == [False, True], ConfigurableAgentHandler.config
+        repaired = (project / "src/screens/HomeScreen.tsx").read_text(encoding="utf-8")
+        assert "Home repaired" in repaired
     finally:
         server.shutdown()
         server.server_close()
@@ -398,24 +467,21 @@ def test_dashboard_pause_resume_toggle():
 def test_dashboard_thinking_and_code_streams():
     from forge_harness.utils.dashboard import Dashboard
     console = Console(file=io.StringIO(), width=130, force_terminal=False)
-    d = Dashboard("run1", "interactive", {}, console=console)
+    d = Dashboard("run1", "interactive", {"llm": {"display_reasoning_stream": True}}, console=console)
     d.start()
-    # Streaming thinking deltas
+    # Streamed chunks are buffered into a single message instead of being split
+    # into dozens of unrelated transcript entries.
+    d.on_llm_event("llm_request_start", {"agent": "coder", "provider": "test", "model": "mock", "attempt": 1, "max_attempts": 1})
     d.on_llm_event("llm_reasoning_delta", {"agent": "coder", "text": "Let me plan the patch structure..."})
     d.on_llm_event("llm_reasoning_delta", {"agent": "coder", "text": " I need to create HomeScreen.tsx"})
     assert d.last_thinking_tokens > 0
     assert d.thinking_tokens > 0
-    thinking_msgs = [m for m in d.messages if m.kind == "thinking"]
-    assert len(thinking_msgs) == 2
-    assert "Let me plan" in thinking_msgs[0].content
+    assert not [m for m in d.messages if m.kind == "thinking"]  # deferred until request completion
 
-    # Streaming code deltas
-    d.on_llm_event("llm_text_delta", {"agent": "coder", "text": "{ \"operations\": ["})
-    d.on_llm_event("llm_text_delta", {"agent": "coder", "text": " { \"type\": \"create_file\" } }"})
-    code_msgs = [m for m in d.messages if m.kind == "code"]
-    assert len(code_msgs) == 2
+    d.on_llm_event("llm_text_delta", {"agent": "coder", "text": '{ "operations": ['})
+    d.on_llm_event("llm_text_delta", {"agent": "coder", "text": ' { "type": "create_file" } }'})
+    assert not [m for m in d.messages if m.kind == "assistant_output"]
 
-    # Request done with thinking tokens in usage
     d.on_llm_event("llm_request_done", {
         "agent": "coder",
         "duration_s": 1.5,
@@ -427,7 +493,13 @@ def test_dashboard_thinking_and_code_streams():
     assert d.total_tokens == 300
     result_msgs = [m for m in d.messages if m.kind == "result"]
     assert len(result_msgs) == 1
-    assert "thinking: 50 tok" in result_msgs[0].content
+    assert "300 tokens" in result_msgs[0].content
+    thinking_msgs = [m for m in d.messages if m.kind == "thinking"]
+    assert len(thinking_msgs) == 1
+    assert "Let me plan" in thinking_msgs[0].content
+    outputs = [m for m in d.messages if m.kind == "assistant_output"]
+    assert len(outputs) == 1
+    assert outputs[0].content == '{ "operations": [ { "type": "create_file" } }'
     d.stop("completed")
 
 

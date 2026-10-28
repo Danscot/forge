@@ -224,17 +224,19 @@ class HarnessRunner:
                         registry_snapshot = self.registry.refresh()
                         self.dashboard.active_agent = "coder"
                         self.active_agent = "coder"
-                        # On retries, restore the pre-task snapshot so every attempt plans
-                        # from a clean baseline rather than a half-applied previous attempt.
+                        # Keep the previous attempt's working tree for targeted repair.
+                        # The diagnosis and repair plan are produced from the failed
+                        # implementation; restoring the task-start snapshot here would
+                        # delete those files and make the next plan stale (for example,
+                        # App.tsx imports components that the retry silently removed).
+                        # _extend_snapshot preserves the original pre-task contents for
+                        # every newly touched path, and the original snapshot is restored
+                        # only after the task exhausts retries or is interrupted/resumed.
                         if attempt_index > 0:
-                            self._set_stage(ExecutionStage.RESTORING_FILES)
-                            try:
-                                self._restore_snapshot(snapshot_data)
-                            except Exception as rollback_exc:
-                                self.logger.exception("Pre-retry snapshot restore failed", extra={"task_id": task.id})
-                                self.dashboard.activity_message("WARN", f"Pre-retry restore failed: {rollback_exc}")
-                            created_paths = set()
-                            task.last_report["created_paths"] = []
+                            self.dashboard.activity_message(
+                                "INFO",
+                                "Continuing from the previous attempt for targeted repair; original snapshot retained for final rollback",
+                            )
                         self._set_stage(ExecutionStage.PLANNING_CHANGES)
                         self.dashboard.activity_message("INFO", f"Planning a surgical patch · attempt {attempt_index + 1}/{max_retries + 1}")
                         approved_plan = coder_agent.plan_changes(task, target_spec, vision_spec, registry_snapshot, diagnostics_in, self.file_ops)
@@ -324,10 +326,31 @@ class HarnessRunner:
                                 route = task.route or "/"
                                 screenshot = task_dir / "screenshots" / f"attempt_{attempt_index + 1}.png"
                                 mockup_abs = [str(self.file_ops.resolve(path)) for path in task.mockup_paths]
-                                render_result = renderer.capture(base_url, route, screenshot, task.test_plan)
+                                effective_test_plan = self._effective_test_plan(task)
+                                if task.test_plan and not effective_test_plan:
+                                    self.dashboard.activity_message(
+                                        "INFO",
+                                        f"Skipped {len(task.test_plan)} screen-level browser check(s) for '{task.type}' task; "
+                                        "these checks belong to a screen/integration task.",
+                                    )
+                                render_result = renderer.capture(base_url, route, screenshot, effective_test_plan)
                                 task.last_report["last_screenshot_path"] = str(screenshot)
                                 self.dashboard.set_validation("Runtime", "PASS" if not render_result.get("page_errors") else "FAIL")
                                 self.dashboard.set_validation("Functional", "PASS" if render_result.get("functional_pass") else "FAIL")
+                                failed_steps = [step for step in render_result.get("test_results", []) if not step.get("passed")]
+                                if failed_steps:
+                                    compact_failures = [
+                                        {"action": step.get("action"), "description": step.get("description"), "error": step.get("error")}
+                                        for step in failed_steps[:5]
+                                    ]
+                                    self.logger.warning("Functional browser checks failed: %s", json.dumps(compact_failures, ensure_ascii=False))
+                                    self.dashboard.activity_message(
+                                        "ERROR",
+                                        "Browser checks failed: " + "; ".join(
+                                            f"{item.get('description') or item.get('action')}: {item.get('error', 'failed')}"
+                                            for item in compact_failures
+                                        )[:1200],
+                                    )
                                 self.dashboard.activity_message("PASS", f"Rendered screenshot: {screenshot.relative_to(root)}")
                                 custom_cmd = self.config.get("project", {}).get("functional_check_command", []) or []
                                 if custom_cmd:
@@ -356,7 +379,8 @@ class HarnessRunner:
                             self.dashboard.set_validation("Functional", "FAIL")
 
                         critic_report = None
-                        if render_result and task.last_report.get("last_screenshot_path"):
+                        visual_review_required = self._requires_visual_review(task)
+                        if render_result and task.last_report.get("last_screenshot_path") and visual_review_required:
                             try:
                                 mockup_abs = [str(self.file_ops.resolve(path)) for path in task.mockup_paths]
                                 critic_report = critic_agent.inspect(
@@ -365,7 +389,7 @@ class HarnessRunner:
                                 )
                                 self.dashboard.set_validation("Visual critic", str(critic_report.get("status", "FAIL")))
                                 self.dashboard.set_score(float(critic_report.get("quality_score", 0)))
-                                self.dashboard.activity_message("PASS" if critic_report.get("status") == "PASS" else "WARN", f"Critic: {critic_report.get('status')} · quality {critic_report.get('quality_score', 0):.1f}/100")
+                                self.dashboard.activity_message("PASS" if critic_report.get("status") == "PASS" else "WARN", f"Critic verdict: {critic_report.get('status')} · model-reported quality {critic_report.get('reported_quality_score', critic_report.get('quality_score', 0)):.1f}/100")
                             except LLMError as exc:
                                 # Don't turn a provider outage into an invented visual verdict.
                                 evidence["critic_error"] = str(exc)
@@ -386,9 +410,29 @@ class HarnessRunner:
                                 self.dashboard.set_validation("Visual critic", "ERROR")
                         else:
                             self.dashboard.set_validation("Visual critic", "SKIPPED")
+                            if render_result and not visual_review_required:
+                                evidence["critic_skipped_reason"] = f"Task type '{task.type}' has no visual acceptance scope; visual review is deferred to screen/integration tasks."
+                                self.dashboard.activity_message("INFO", f"Visual critic skipped for {task.type} task; technical and functional gates remain mandatory")
 
-                        report = self._evaluate_gates(typecheck, render_result, custom_functional, critic_report, evidence, bool(task.mockup_paths))
+                        report = self._evaluate_gates(
+                            typecheck, render_result, custom_functional, critic_report, evidence,
+                            bool(task.mockup_paths), task.type,
+                        )
+                        self.dashboard.set_score(float(report.get("quality_score", 0)))
+                        self.dashboard.activity_message(
+                            "INFO",
+                            f"Effective validation score {report.get('quality_score', 0):.1f}/100 "
+                            f"(functional {report.get('functional_score', 0):.1f}, visual {report.get('visual_score', 0):.1f}; "
+                            f"visual gate {'required' if report.get('visual_gate_required') else 'advisory'})",
+                        )
                         report.update({"evidence": evidence, "critic": critic_report, "vision_spec": vision_spec, "created_paths": sorted(created_paths)})
+                        if not report.get("accepted"):
+                            reasons = report.get("rejection_reasons", [])
+                            reason_text = "; ".join(reasons) if reasons else "No rejection reason was recorded"
+                            self.dashboard.activity_message(
+                                "WARN",
+                                f"Acceptance rejected · effective quality {report.get('quality_score', 0):.1f}/100 · {reason_text}",
+                            )
                         task.last_report = report
                         decision = router.after_validation(task, attempt_index, report, max_retries)
                         # Router's retry_count is not the same as this loop's index; persist the exact attempt index.
@@ -429,13 +473,25 @@ class HarnessRunner:
                     except (LLMError, AgentOutputError, FileOperationError, ShellExecutionError, Exception) as exc:
                         # Persist the raw model response when patch parsing failed so it can be inspected.
                         raw_persisted = None
-                        if isinstance(exc, PatchParseError) and getattr(exc, "raw_content", None):
-                            try:
-                                raw_path = task_dir / f"raw_response_attempt_{self.current_attempt}.txt"
-                                raw_path.write_text(exc.raw_content, encoding="utf-8")
-                                raw_persisted = str(raw_path)
-                            except OSError:
-                                self.logger.exception("Could not persist raw model response")
+                        if isinstance(exc, PatchParseError):
+                            raw_attempts = getattr(exc, "raw_attempts", []) or []
+                            final_raw = getattr(exc, "raw_content", "") or (raw_attempts[-1] if raw_attempts else "")
+                            if final_raw or raw_attempts:
+                                try:
+                                    # Preserve earlier structured-repair responses too. This
+                                    # allows comparison of the invalid first output with the
+                                    # final response without rerunning an expensive model call.
+                                    for response_index, raw_response in enumerate(raw_attempts[:-1], start=1):
+                                        repair_path = task_dir / (
+                                            f"raw_response_attempt_{self.current_attempt}_repair_{response_index}.txt"
+                                        )
+                                        repair_path.write_text(str(raw_response), encoding="utf-8")
+                                    if final_raw:
+                                        raw_path = task_dir / f"raw_response_attempt_{self.current_attempt}.txt"
+                                        raw_path.write_text(str(final_raw), encoding="utf-8")
+                                        raw_persisted = str(raw_path)
+                                except OSError:
+                                    self.logger.exception("Could not persist raw model response")
                         stage = self.current_stage or "unknown"
                         evidence = {
                             "stage_error": f"{exc.__class__.__name__}: {exc}",
@@ -629,6 +685,28 @@ class HarnessRunner:
         )
         return self._server.start()
 
+    @staticmethod
+    def _requires_visual_review(task: Task) -> bool:
+        """Visual acceptance belongs to screen/integration tasks or an explicit mockup."""
+        task_type = str(task.type or "").strip().lower()
+        return bool(task.mockup_paths) or task_type in {"screen", "integration"}
+
+    @staticmethod
+    def _requires_functional_review(task: Task) -> bool:
+        """Browser interaction assertions are scoped to a screen, integration, or mockup.
+
+        Foundation/design-token/shared-component tasks may smoke-render the existing
+        application, but must not be forced to satisfy screen-level selectors before a
+        later task mounts those components.
+        """
+        task_type = str(task.type or "").strip().lower()
+        return bool(task.mockup_paths) or task_type in {"screen", "integration"}
+
+    @classmethod
+    def _effective_test_plan(cls, task: Task) -> list[dict[str, Any]]:
+        """Return only browser checks appropriate to this task's acceptance scope."""
+        return list(task.test_plan) if cls._requires_functional_review(task) else []
+
     def _evaluate_gates(
         self,
         typecheck: dict[str, Any],
@@ -637,49 +715,92 @@ class HarnessRunner:
         critic: dict[str, Any] | None,
         evidence: dict[str, Any],
         has_mockup: bool,
+        task_type: str = "screen",
     ) -> dict[str, Any]:
         cfg = self.config.get("validation", {})
         typecheck_pass = bool(typecheck.get("passed")) if cfg.get("require_typecheck", True) else True
         render_pass = bool(render) and (not render.get("page_errors") if cfg.get("fail_on_page_errors", True) else True)
         if cfg.get("require_runtime_render", True) and not render:
             render_pass = False
+        task_type = str(task_type or "").strip().lower()
+        functional_gate_required = bool(task_type in {"screen", "integration"} or has_mockup)
         task_tests = (render or {}).get("test_results", [])
         task_tests_pass = all(item.get("passed", False) for item in task_tests)
         custom_pass = custom_functional is None or bool(custom_functional.get("passed"))
-        functional_pass = bool(render and render.get("functional_pass") and task_tests_pass and custom_pass)
-        if cfg.get("require_functional_checks", False) and not (task_tests or custom_functional):
-            functional_pass = False
+        if functional_gate_required:
+            functional_pass = bool(render and render.get("functional_pass") and task_tests_pass and custom_pass)
+            if cfg.get("require_functional_checks", False) and not (task_tests or custom_functional):
+                functional_pass = False
+        else:
+            # For foundation/design-token/shared-component tasks, arbitrary test_plan
+            # entries are out of scope. Keep a deterministic render/runtime smoke gate
+            # and any explicitly configured functional command, without forcing a later
+            # screen's controls/selectors to exist yet.
+            functional_pass = bool(render) and (not render.get("page_errors") if cfg.get("fail_on_page_errors", True) else True) and custom_pass
         if cfg.get("fail_on_console_errors", False) and render and render.get("console_errors"):
             functional_pass = False
+
+        # Visual scoring is a blocking acceptance gate only when this task is expected
+        # to produce a screen/integration or explicitly references a mockup. Otherwise,
+        # a partial screenshot (for example, a foundation task before HomeScreen exists)
+        # is not valid evidence that the shared-component task failed.
+        visual_gate_required = bool(
+            task_type in {"screen", "integration"}
+            or (has_mockup and cfg.get("require_visual_critic_when_mockup_exists", True))
+        )
         weights = cfg.get("functional_weight", 0.6), cfg.get("visual_weight", 0.4)
         functional_score = float((critic or {}).get("functional_score", 100 if functional_pass else 0))
         visual_score = float((critic or {}).get("visual_score", 0))
         total_weight = max(0.0001, float(weights[0]) + float(weights[1]))
-        quality_score = (functional_score * float(weights[0]) + visual_score * float(weights[1])) / total_weight
-        visual_critic_required = bool(cfg.get("require_visual_critic_when_mockup_exists", True) and has_mockup)
-        critic_pass = bool(critic and str(critic.get("status", "FAIL")).upper() == "PASS" and not critic.get("critical_failure", False))
-        if critic and visual_score < 0:
-            critic_pass = False
-        if not visual_critic_required and critic is None:
+        if visual_gate_required:
+            quality_score = (functional_score * float(weights[0]) + visual_score * float(weights[1])) / total_weight
+            critic_pass = bool(critic and str(critic.get("status", "FAIL")).upper() == "PASS" and not critic.get("critical_failure", False))
+            high_issues = [issue for issue in (critic or {}).get("issues", []) if str(issue.get("severity", "")).lower() in {"critical", "high"}]
+        else:
+            # Do not let the critic's view of an intentionally incomplete screen
+            # overrule the deterministic checks for a non-visual task.
+            quality_score = 100.0 if typecheck_pass and render_pass and functional_pass else 0.0
             critic_pass = True
+            high_issues = []
         score_pass = quality_score >= float(cfg.get("minimum_quality_score", 75))
-        high_issues = [issue for issue in (critic or {}).get("issues", []) if str(issue.get("severity", "")).lower() in {"critical", "high"}]
         accepted = typecheck_pass and render_pass and functional_pass and critic_pass and score_pass and not high_issues
-        if cfg.get("require_visual_critic_when_mockup_exists", True) and has_mockup and critic is None:
+        if visual_gate_required and critic is None:
             accepted = False
+
+        rejection_reasons: list[str] = []
+        if not typecheck_pass:
+            rejection_reasons.append("TypeScript/type-check gate failed")
+        if not render_pass:
+            rejection_reasons.append("Runtime render gate failed")
+        if not functional_pass:
+            rejection_reasons.append("Functional checks failed or required functional evidence is missing")
+        if visual_gate_required and not critic_pass:
+            rejection_reasons.append("Visual critic did not pass or reported a critical failure")
+        if not score_pass:
+            rejection_reasons.append(
+                f"Effective quality score {quality_score:.1f} is below minimum {float(cfg.get('minimum_quality_score', 75)):.1f}"
+            )
+        if high_issues:
+            rejection_reasons.append(f"Visual critic reported {len(high_issues)} high/critical issue(s)")
+        if visual_gate_required and critic is None:
+            rejection_reasons.append("Visual review is required for this task but no critic report was produced")
         return {
             "accepted": accepted,
             "typecheck_pass": typecheck_pass,
             "runtime_pass": render_pass,
             "functional_pass": functional_pass,
+            "functional_gate_required": functional_gate_required,
+            "visual_gate_required": visual_gate_required,
             "critic_pass": critic_pass,
             "quality_score": round(quality_score, 2),
             "functional_score": round(functional_score, 2),
             "visual_score": round(visual_score, 2),
             "score_pass": score_pass,
             "high_severity_issues": high_issues,
+            "rejection_reasons": rejection_reasons,
             "gate_summary": {
                 "typecheck": typecheck_pass, "runtime": render_pass, "functional": functional_pass,
+                "functional_scope_required": functional_gate_required,
                 "critic": critic_pass, "quality_threshold": score_pass,
             },
         }

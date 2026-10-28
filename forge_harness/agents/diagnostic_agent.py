@@ -18,7 +18,19 @@ class DiagnosticAgent(BaseAgent):
             f"EVIDENCE:\n{json.dumps(evidence, ensure_ascii=False, indent=2)[:22000]}\n\n"
             "Provide a targeted repair diagnosis, separating confirmed evidence from hypotheses."
         )
-        parsed, _result = self.ask_json(text)
+        llm_cfg = self.config.get("llm", {}) or {}
+        effort_cfg = llm_cfg.get("effort_policy", {}) or {}
+        escalation = effort_cfg.get("diagnostic_escalation", {}) if isinstance(effort_cfg, dict) else {}
+        threshold = max(1, int(escalation.get("after_task_retries", 2)))
+        profile_override = None
+        if task.retry_count >= threshold:
+            # Only spend extra reasoning after the first targeted repair did not work.
+            profile_override = {
+                "thinking_enabled": True,
+                "thinking_budget": max(1024, int(escalation.get("thinking_budget", 2048))),
+                "max_output_tokens": max(4000, int(escalation.get("max_output_tokens", 5000))),
+            }
+        parsed, _result = self.ask_json(text, profile_override=profile_override)
         if not isinstance(parsed.get("next_steps", []), list):
             raise AgentOutputError("Diagnostic response must include next_steps array")
         return parsed

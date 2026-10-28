@@ -27,7 +27,20 @@ class PlannerAgent(BaseAgent):
             "\n\nPlan the implementation. Existing screens/components should be preserved and reused where sensible."
         )
         images = [str(file_ops.resolve(item["path"])) for item in input_manifest.get("mockups", []) if item.get("path")]
-        parsed, _result = self.ask_json(user_text, image_paths=images)
+        # Scale planning effort to the amount of context. Small specs without mockups
+        # get a fast pass; large specs or many mockups get a larger reasoning allowance.
+        effort_override: dict[str, Any] | None = None
+        context_size = len(target_spec) + len(files) + len(mockup_summary)
+        mockup_count = len(input_manifest.get("mockups", []))
+        effort_cfg = self.config.get("llm", {}).get("effort_policy", {}) or {}
+        thresholds = effort_cfg.get("planner_thresholds", {}) if isinstance(effort_cfg, dict) else {}
+        simple_chars = max(1000, int(thresholds.get("simple_context_chars", 12000)))
+        complex_chars = max(simple_chars + 1, int(thresholds.get("complex_context_chars", 30000)))
+        if context_size <= simple_chars and mockup_count <= 1:
+            effort_override = {"thinking_enabled": True, "thinking_budget": 1024, "max_output_tokens": 6500}
+        elif context_size >= complex_chars or mockup_count >= 5:
+            effort_override = {"thinking_enabled": True, "thinking_budget": 3072, "max_output_tokens": 8192}
+        parsed, _result = self.ask_json(user_text, image_paths=images, profile_override=effort_override)
         raw_tasks = parsed.get("tasks")
         if not isinstance(raw_tasks, list) or not raw_tasks:
             raise AgentOutputError("Planner response must contain a non-empty tasks array")
@@ -52,6 +65,12 @@ class PlannerAgent(BaseAgent):
                 needle = str(raw["screen"]).lower().replace(" ", "_")
                 mockup_paths = [str(item["path"]) for item in input_manifest.get("mockups", []) if needle in Path(str(item.get("path", ""))).stem.lower()]
             dependencies = [str(dependency) for dependency in raw.get("dependencies", []) if str(dependency) in known]
+            # Browser interaction plans describe an implemented screen, not a future
+            # screen that a foundation/design-system task has not composed yet. Keep
+            # planner output in scope: only screen/integration tasks (or tasks tied to
+            # an explicit mockup) may execute browser-level test steps.
+            raw_test_plan = [step for step in raw.get("test_plan", []) if isinstance(step, dict)]
+            test_plan = raw_test_plan if (task_type in {"screen", "integration"} or mockup_paths) else []
             task = Task(
                 id=task_id,
                 type=task_type,
@@ -62,7 +81,7 @@ class PlannerAgent(BaseAgent):
                 mockup_paths=mockup_paths,
                 dependencies=dependencies,
                 acceptance_criteria=[str(v) for v in raw.get("acceptance_criteria", []) if v],
-                test_plan=[step for step in raw.get("test_plan", []) if isinstance(step, dict)],
+                test_plan=test_plan,
                 expected_files=[str(p) for p in raw.get("expected_files", [])],
             )
             tasks.append(task)

@@ -109,7 +109,27 @@ class LLMRuntime:
 
     All model-related tunables live in YAML profiles. Provider-specific parameters are
     mapped via llm.providers.<provider>.parameter_map, including dotted/nested fields.
+
+    A role-aware effort policy is applied by default so every agent does not spend the
+    same reasoning budget. Project configuration can override individual role defaults
+    under ``llm.effort_policy.agents`` or disable policy application altogether.
+    Per-call ``profile_override`` values remain the highest-priority settings.
     """
+
+    DEFAULT_EFFORT_PROFILES: dict[str, dict[str, Any]] = {
+        # Planning needs real decomposition, but 4k reasoning tokens is excessive for
+        # most mobile-app specs. Large specs can opt into the higher tier at call time.
+        "planner": {"thinking_enabled": True, "thinking_budget": 2048, "max_output_tokens": 6144},
+        # Image analysis is targeted extraction, not an open-ended design essay.
+        "vision": {"thinking_enabled": True, "thinking_budget": 768, "max_output_tokens": 3500},
+        # The coder follows the plan and produces implementation output. It should not
+        # spend a large budget reconsidering architecture already decided upstream.
+        "coder": {"thinking_enabled": False, "max_output_tokens": 12000},
+        # Critic should return a concise, evidence-based verdict; diagnostics can reason
+        # more deeply when repeated validation failures justify it.
+        "critic": {"thinking_enabled": False, "max_output_tokens": 3200},
+        "diagnostic": {"thinking_enabled": True, "thinking_budget": 1024, "max_output_tokens": 4000},
+    }
 
     def __init__(self, config: dict[str, Any], logger: logging.Logger | None = None, event_callback: EventCallback | None = None):
         self.config = config
@@ -134,6 +154,25 @@ class LLMRuntime:
         if not profile:
             raise LLMError(f"No model profile configured for agent '{agent}'", fatal=True)
         merged = dict(profile)
+
+        # Role-aware defaults are intentionally applied AFTER legacy per-agent fields:
+        # older generated configs set every agent to a large thinking budget, which is
+        # the behavior this policy is intended to correct. Users retain full control via
+        # llm.effort_policy.agents.<role>, or can disable it to honor legacy values.
+        effort_policy = self.llm_cfg.get("effort_policy", {}) or {}
+        if not isinstance(effort_policy, dict):
+            effort_policy = {}
+        if bool(effort_policy.get("enabled", True)):
+            role_defaults = self.DEFAULT_EFFORT_PROFILES.get(agent, {})
+            merged.update(role_defaults)
+            if role_defaults.get("thinking_enabled") is False and "thinking_budget" not in role_defaults:
+                # Avoid carrying a stale large legacy budget in requests where reasoning
+                # is disabled. A deliberate role override may still set it explicitly.
+                merged.pop("thinking_budget", None)
+            overrides = effort_policy.get("agents", {}) or {}
+            if isinstance(overrides, dict) and isinstance(overrides.get(agent), dict):
+                merged.update(overrides[agent])
+
         merged.setdefault("streaming", self.llm_cfg.get("streaming", True))
         merged.setdefault("timeout_s", self.llm_cfg.get("request_timeout_s", 120))
         return merged
@@ -268,6 +307,14 @@ class LLMRuntime:
             profile = self._profile(agent)
             if profile_override:
                 profile.update(profile_override)
+            self._emit(
+                "effort_profile_applied",
+                agent=agent,
+                thinking_enabled=profile.get("thinking_enabled"),
+                thinking_budget=profile.get("thinking_budget"),
+                max_output_tokens=profile.get("max_output_tokens"),
+                call_override=bool(profile_override),
+            )
             all_messages = self._messages_with_images(messages, image_paths)
             candidates = self._candidate_profiles(agent, profile)
             errors: list[str] = []

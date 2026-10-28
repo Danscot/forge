@@ -6,7 +6,7 @@ FORGE is a Python-driven, multi-agent coding harness for Expo + React Native + T
 
 ## What is implemented
 
-- Interactive Rich TUI inspired by coding-agent terminals: live activity, current agent/model, streaming output, provider-exposed reasoning stream (when available), request attempts, token usage, latency, validation gates, and task progress.
+- Interactive Rich CLI inspired by coding-agent terminals: an append-only chat transcript, complete model responses, current agent/model, provider-exposed reasoning stream (when available), request attempts, token usage, latency, validation gates, and task progress. Earlier messages remain available through normal terminal scrollback (Shift+PgUp / mouse wheel); only the compact status line updates in place.
 - Central OpenAI-compatible LLM runtime with provider profiles and agent-level model selection.
 - Streaming chat completions, token-usage collection when the provider includes it, per-provider headers/parameters, nested parameter mapping, and configurable fallbacks.
 - Configurable temperature, top-p, output token budget, thinking enablement/budget, request parameters, timeouts, streaming, retry counts, exponential backoff, jitter, and JSON-repair attempts.
@@ -120,7 +120,7 @@ The interactive REPL also supports `run`, `resume <run_id>`, `mode <mode>`, `roo
 
 ## LLM configuration
 
-All LLM calling tunables belong in `.harness/config.yaml`; the agent source files do not contain hardcoded sampling defaults. The template starts with the NVIDIA, Gemini, OpenRouter, OpenAI, and Z.ai OpenAI-compatible endpoints and agent profiles for `planner`, `vision`, `coder`, `critic`, and `diagnostic`.
+Model and provider settings live in `.harness/config.yaml`. The runtime supplies configurable role-aware effort defaults and per-call adaptation so old generated configs also benefit without needing a manual migration. The template starts with the NVIDIA, Gemini, OpenRouter, OpenAI, and Z.ai OpenAI-compatible endpoints and agent profiles for `planner`, `vision`, `coder`, `critic`, and `diagnostic`.
 
 Examples:
 
@@ -128,9 +128,10 @@ Examples:
 # Change sampling / generation settings without editing Python
 forge config set llm.agents.coder.temperature 0.25
 forge config set llm.agents.coder.top_p 0.9
+# Cap patch responses explicitly only when needed; otherwise the cap scales with planned operations.
 forge config set llm.agents.coder.max_output_tokens 12000
-forge config set llm.agents.coder.thinking_enabled true
-forge config set llm.agents.coder.thinking_budget 4096
+forge config set llm.effort_policy.agents.coder.thinking_enabled false
+forge config set llm.effort_policy.agents.planner.thinking_budget 3072
 forge config set llm.agents.coder.streaming true
 
 # Choose a different model for only the visual critic
@@ -142,13 +143,13 @@ forge config set llm.agents.critic.model 'gemini:gemini-2.5-flash'
 #     temperature: 0.2
 ```
 
-Each profile supports `model`, `temperature`, `top_p`, `max_output_tokens`, `streaming`, `timeout_s`, `thinking_enabled`, `thinking_budget`, arbitrary `request_params`, and `fallback_models`. The parameters that a provider accepts are not universal. Configure `llm.providers.<provider>.parameter_map` to map canonical fields to its API-specific fields; dotted keys build nested objects. `request_params` can provide additional provider-specific JSON fields.
+Each model profile supports `model`, `temperature`, `top_p`, `max_output_tokens`, `streaming`, `timeout_s`, `thinking_enabled`, `thinking_budget`, arbitrary `request_params`, and `fallback_models`. By default, FORGE applies role-aware effort: the planner gets a moderate reasoning budget (raised for large specs), vision gets a small budget that scales with mockup count, the coder plans and writes patches directly without a large reasoning budget, the critic gives a concise verdict, and diagnostics start focused but escalate after repeated failures. These defaults also apply to projects with older `.harness/config.yaml` files. Customize them under `llm.effort_policy.agents`, `llm.effort_policy.planner_thresholds`, and `llm.effort_policy.diagnostic_escalation`. Set `llm.effort_policy.enabled: false` to disable the role defaults; stage-specific adaptation still applies. The parameters a provider accepts are not universal. Configure `llm.providers.<provider>.parameter_map` to map canonical fields to its API-specific fields; dotted keys build nested objects. `request_params` can provide additional provider-specific JSON fields. Patch generation has separate optional controls under `llm.patch_generation`: thinking is disabled by default for the tightly constrained JSON-patch stage; set `thinking_enabled: true` only if the selected model needs it, and optionally set `max_output_tokens` or `structured_repair_attempts`.
 
 The default endpoint family is OpenAI-compatible, but not every provider/model supports every parameter or multimodal input. An unsupported parameter should be removed or remapped in config; FORGE will surface provider errors rather than pretending a setting took effect.
 
 ### Thinking visibility
 
-The TUI displays a **Thinking / reasoning stream** when the API actually returns a configured reasoning field. The default reasoning field names are configurable per provider. Image attachment count and aggregate upload size are capped by `llm.max_images_per_request`, `llm.max_total_image_bytes`, and `project.max_image_bytes`. Some models/providers do not expose a separate thinking stream, even if reasoning is enabled; the panel will state that no stream was received rather than inventing one.
+The CLI displays provider-exposed reasoning metadata only when enabled and actually returned by the API; it does not fabricate reasoning. Streamed text chunks are buffered into a single response panel instead of being rendered as separate messages. Image attachment count and aggregate upload size are capped by `llm.max_images_per_request`, `llm.max_total_image_bytes`, and `project.max_image_bytes`. Some models/providers do not expose a separate reasoning stream, even if reasoning is enabled.
 
 ### Token usage and cost
 

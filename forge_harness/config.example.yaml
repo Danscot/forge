@@ -1,5 +1,5 @@
 # FORGE configuration template. Copy to <project>/.harness/config.yaml via `forge init`.
-# The code intentionally does not hardcode model sampling/thinking values; edit these profiles.
+# Provider/model settings are configured below; role-aware effort defaults are applied by the runtime. Edit effort_policy to customize them.
 version: 1
 
 project:
@@ -41,6 +41,55 @@ llm:
   backoff_multiplier: 2.0
   jitter_fraction: 0.25
   structured_repair_attempts: 1
+  # Patch generation is already constrained by the approved plan. Disable model
+  # thinking for that stage by default to avoid spending minutes on unneeded reasoning.
+  # Set thinking_enabled: true if your selected model needs reasoning to author patches.
+  # Role-aware effort policy is enabled by default, including for projects initialized
+  # with an older config. It overrides old per-agent thinking budgets so every agent
+  # does not spend the same amount of reasoning. Set enabled: false to honor only the
+  # legacy llm.agents.* values below. Customize role defaults under agents; per-call
+  # adaptation and patch_generation controls still apply separately.
+  # Call-specific adaptation (small/large planner input, multi-mockup vision, repeated
+  # validation failures) remains active because it is separate from these base profiles.
+  effort_policy:
+    enabled: true
+    agents:
+      planner:
+        thinking_enabled: true
+        thinking_budget: 2048
+        max_output_tokens: 6144
+      vision:
+        thinking_enabled: true
+        thinking_budget: 768
+        max_output_tokens: 3500
+      coder:
+        thinking_enabled: false
+        max_output_tokens: 12000
+      critic:
+        thinking_enabled: false
+        max_output_tokens: 3200
+      diagnostic:
+        thinking_enabled: true
+        thinking_budget: 1024
+        max_output_tokens: 4000
+    # Small projects use a cheaper planner pass; large specs / many mockups escalate.
+    planner_thresholds:
+      simple_context_chars: 12000
+      complex_context_chars: 30000
+    # Diagnostic effort only increases after repeated failed repair attempts.
+    diagnostic_escalation:
+      after_task_retries: 2
+      thinking_budget: 2048
+      max_output_tokens: 5000
+    # Separate planning (small operation plan) from patch authoring (actual code).
+    coder_plan:
+      thinking_enabled: false
+      max_output_tokens: 3500
+  patch_generation:
+    thinking_enabled: false
+    # Optional hard cap; omitted means use the coder agent's max_output_tokens.
+    # max_output_tokens: 8192
+    structured_repair_attempts: 1
   max_images_per_request: 6
   max_total_image_bytes: 14000000
   log_payloads: false
@@ -99,30 +148,30 @@ llm:
         max_output_tokens: "max_tokens"
       reasoning_fields: ["reasoning_content", "reasoning", "thinking"]
 
-  # Each agent is independently configurable. Supported canonical keys include:
-  # provider/model, temperature, top_p, max_output_tokens, streaming, timeout_s,
-  # thinking_enabled, thinking_budget, request_params, fallback_models.
+  # Each agent's provider/model settings remain independent. The enabled effort_policy
+  # above supplies role-aware thinking/token defaults; these legacy fields are honored
+  # when effort_policy.enabled is false, or can be overridden role-by-role above.
   agents:
     planner:
       model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
       temperature: 0.25
       top_p: 0.9
-      max_output_tokens: 8192
+      max_output_tokens: 6144
       context_window_tokens: null # set to the model's documented context window if known
       streaming: true
       thinking_enabled: true
-      thinking_budget: 4096
+      thinking_budget: 2048
       request_params: {}
       fallback_models: []
     vision:
       model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
       temperature: 0.2
       top_p: 0.9
-      max_output_tokens: 8192
+      max_output_tokens: 3500
       context_window_tokens: null # set to the model's documented context window if known
       streaming: true
       thinking_enabled: true
-      thinking_budget: 4096
+      thinking_budget: 768
       request_params: {}
       fallback_models: []
     coder:
@@ -132,30 +181,28 @@ llm:
       max_output_tokens: 12000
       context_window_tokens: null # set to the model's documented context window if known
       streaming: true
-      thinking_enabled: true
-      thinking_budget: 4096
+      thinking_enabled: false
       request_params: {}
       fallback_models: []
     critic:
       model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
       temperature: 0.15
       top_p: 0.9
-      max_output_tokens: 6000
+      max_output_tokens: 3200
       context_window_tokens: null # set to the model's documented context window if known
       streaming: true
-      thinking_enabled: true
-      thinking_budget: 3072
+      thinking_enabled: false
       request_params: {}
       fallback_models: []
     diagnostic:
       model: "nvidia:nvidia/nemotron-3.5-super-vl-120b-a12b"
       temperature: 0.2
       top_p: 0.9
-      max_output_tokens: 6000
+      max_output_tokens: 4000
       context_window_tokens: null # set to the model's documented context window if known
       streaming: true
       thinking_enabled: true
-      thinking_budget: 3072
+      thinking_budget: 1024
       request_params: {}
       fallback_models: []
 

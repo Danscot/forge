@@ -101,6 +101,8 @@ def test_dotted_parameter_mapping():
     config = {
         "llm": {
             "default_provider": "test",
+            # This test exercises raw, legacy profile mapping; role policy is disabled.
+            "effort_policy": {"enabled": False},
             "providers": {"test": {"base_url": "http://localhost/v1", "parameter_map": {"max_output_tokens": "max_tokens", "thinking_enabled": "chat_template_kwargs.enable_thinking", "thinking_budget": "chat_template_kwargs.budget"}}},
             "agents": {"coder": {"model": "test:model", "max_output_tokens": 123, "thinking_enabled": True, "thinking_budget": 1234}},
         }
@@ -110,3 +112,45 @@ def test_dotted_parameter_mapping():
     payload = runtime._build_payload(provider, model, runtime._profile("coder"), [{"role": "user", "content": "hi"}], True)
     assert payload["chat_template_kwargs"] == {"enable_thinking": True, "budget": 1234}
     assert payload["max_tokens"] == 123
+
+
+def test_role_aware_effort_policy_overrides_legacy_uniform_budgets():
+    config = {
+        "llm": {
+            "default_provider": "test",
+            "providers": {"test": {"base_url": "http://localhost/v1", "parameter_map": {}}},
+            "agents": {
+                "planner": {"model": "test:model", "thinking_enabled": True, "thinking_budget": 4096, "max_output_tokens": 8192},
+                "coder": {"model": "test:model", "thinking_enabled": True, "thinking_budget": 4096, "max_output_tokens": 12000},
+                "critic": {"model": "test:model", "thinking_enabled": True, "thinking_budget": 3072, "max_output_tokens": 6000},
+            },
+        }
+    }
+    runtime = LLMRuntime(config)
+    planner = runtime._profile("planner")
+    coder = runtime._profile("coder")
+    critic = runtime._profile("critic")
+
+    assert planner["thinking_enabled"] is True
+    assert planner["thinking_budget"] == 2048
+    assert coder["thinking_enabled"] is False
+    assert "thinking_budget" not in coder
+    assert critic["thinking_enabled"] is False
+    assert critic["max_output_tokens"] == 3200
+
+
+def test_effort_policy_allows_per_agent_override_and_opt_out():
+    config = {
+        "llm": {
+            "effort_policy": {"enabled": True, "agents": {"coder": {"thinking_enabled": True, "thinking_budget": 256}}},
+            "providers": {"test": {"base_url": "http://localhost/v1", "parameter_map": {}}},
+            "agents": {"coder": {"model": "test:model", "thinking_enabled": True, "thinking_budget": 4096, "max_output_tokens": 12000}},
+        }
+    }
+    runtime = LLMRuntime(config)
+    assert runtime._profile("coder")["thinking_enabled"] is True
+    assert runtime._profile("coder")["thinking_budget"] == 256
+
+    config["llm"]["effort_policy"] = {"enabled": False}
+    legacy_runtime = LLMRuntime(config)
+    assert legacy_runtime._profile("coder")["thinking_budget"] == 4096

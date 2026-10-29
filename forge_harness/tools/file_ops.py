@@ -15,6 +15,25 @@ class FileOperationError(RuntimeError):
 class FileOps:
     """Project-root-confined reads and transactional, narrowly scoped file changes."""
 
+    BINARY_ASSET_SUFFIXES = frozenset({
+        ".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp", ".ico",
+        ".avif", ".heic", ".tif", ".tiff", ".woff", ".woff2", ".ttf", ".otf",
+        ".mp3", ".mp4", ".mov", ".wav", ".pdf", ".zip",
+    })
+
+    @classmethod
+    def is_binary_asset_path(cls, file_path: str | Path) -> bool:
+        return Path(str(file_path)).suffix.lower() in cls.BINARY_ASSET_SUFFIXES
+
+    @classmethod
+    def validate_text_target(cls, file_path: str | Path) -> None:
+        if cls.is_binary_asset_path(file_path):
+            raise FileOperationError(
+                f"Text patch operations cannot create or overwrite binary asset '{file_path}'. "
+                "Use an existing asset listed in the available asset inventory, or build a native "
+                "React Native placeholder with View/Text; do not emit text content as PNG/JPEG bytes."
+            )
+
     def __init__(self, project_root: Path, config: dict[str, Any] | None = None):
         self.root = project_root.expanduser().resolve()
         self.config = config or {}
@@ -127,6 +146,7 @@ class FileOps:
             raw_path = operation.get("path")
             if not raw_path:
                 raise FileOperationError(f"Operation {index + 1} has no path")
+            self.validate_text_target(raw_path)
             path = self.resolve(raw_path, for_write=True)
             if path not in original_by_path:
                 if path.exists():

@@ -755,6 +755,11 @@ class CoderAgent(BaseAgent):
             except FileOperationError as exc:
                 raise AgentOutputError(str(exc)) from exc
             normalized_path = str(path).replace("\\", "/")
+            if FileOps.is_binary_asset_path(normalized_path):
+                raise AgentOutputError(
+                    f"Planned operation targets binary asset {path}; text-based file operations cannot generate image/font/media bytes. "
+                    "Use only an existing asset from the supplied inventory or implement a native React Native placeholder."
+                )
             if normalized_path in {"tsconfig.json", "package.json"} or normalized_path.startswith("tsconfig.json"):
                 raise AgentOutputError(f"Direct changes to {path} are not permitted by the coder; update harness configuration instead.")
             if operation_type == "overwrite_file" and target.exists() and not target.is_file():
@@ -892,6 +897,7 @@ class CoderAgent(BaseAgent):
         for operation in operations:
             op_type = str(operation.get("type"))
             op_path = str(operation.get("path"))
+            FileOps.validate_text_target(op_path)
             op_old_text = operation.get("old_text")
             candidates = [
                 (index, item) for index, item in enumerate(planned)

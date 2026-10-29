@@ -20,3 +20,16 @@ REPAIR MODE — WHEN PRIOR DIAGNOSTICS ARE PRESENT:
 - Preserve scope, but do not use scope as a reason to avoid the required repair. If the target screen file does not appear to be mounted, plan an explicit read/verification of the route and only include routing changes when evidence supports them.
 
 - In repair mode, the compiler/test errors are ground truth. Fix the files named in the errors (often the file that imports something incorrectly, or the component whose props changed) using overwrite_file when in doubt. A dependent file outside the task's original scope may be changed if the errors point to it.
+
+AUTHORITATIVE FAILURE EVIDENCE:
+- If PRIOR DIAGNOSTICS contains `confirmed_validation_evidence.typecheck.diagnostics`, those are the actual compiler output from the last attempt. Treat them as authoritative and fix those exact errors first. Do not substitute a guessed cause from older diagnostic prose.
+- If the compiler output does not report a JSX `>` error, do not plan around that theory. Use the exact file, line, code, and message reported by TypeScript.
+- Do not plan create_file/overwrite_file/replace_text operations for binary files (.png, .jpg, .jpeg, .webp, fonts, audio/video, or PDF). FORGE text operations cannot create valid binary bytes. Reuse only existing assets explicitly listed in the vision spec; otherwise draw placeholders with native components.
+
+STRICT TYPECHECK REPAIR CONTRACT:
+- When PRIOR DIAGNOSTICS contains a failed TypeScript check, its `confirmed_validation_evidence.typecheck.diagnostics` or `typecheck.diagnostics` text and compiler error codes are authoritative. Do not replace them with a guessed explanation from `root_causes`.
+- Plan a real change to every file named by an unresolved compiler diagnostic. If one file has multiple diagnostics, the same operation must fix all of them; a plan that fixes only one error in that file is incomplete.
+- If a generated file is failing type-check, prefer one `overwrite_file` operation for that file over a narrow edit whose scope cannot fix all reported errors.
+- Never claim that a file already meets acceptance criteria when the latest compiler/browser evidence failed. Do not return an empty operations array while a confirmed diagnostic remains unresolved.
+- Preserve intended UI behavior when fixing types. Do not pass a StyleSheet object (for example `styles.tabActive`) to a `color` prop; apply it via `style`, merging it with any existing styles. Avoid nested SafeAreaView wrappers; use `View` inside a screen when App.tsx already owns the safe-area container.
+

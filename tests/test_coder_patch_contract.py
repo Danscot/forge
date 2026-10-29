@@ -684,3 +684,25 @@ def test_screen_plan_upgrades_stale_app_anchor_to_mount_rewrite(tmp_path: Path):
     assert app_ops[0]["type"] == "overwrite_file"
     assert "stale anchor" not in app_ops[0]
     assert "actually render <HomeScreen />" in app_ops[0]["content_outline"]
+
+
+def test_plan_rejects_text_operations_for_binary_asset_paths(tmp_path: Path):
+    from forge_harness.agents.base import AgentOutputError
+
+    validator = _validator()
+    plan = {
+        "risk": "low",
+        "operations": [{"type": "create_file", "path": "assets/images/course-4.png"}],
+    }
+    with pytest.raises(AgentOutputError, match="binary asset"):
+        validator._validate_plan(plan, FileOps(tmp_path))
+
+
+def test_patch_rejects_binary_asset_path_even_if_plan_contains_it(tmp_path: Path):
+    from forge_harness.tools.file_ops import FileOperationError
+
+    validator = _validator()
+    plan = {"operations": [{"type": "create_file", "path": "assets/images/logo.png"}]}
+    patch = [{"type": "create_file", "path": "assets/images/logo.png", "content": "not a png"}]
+    with pytest.raises(FileOperationError, match="binary asset"):
+        validator._validate_patch_against_plan(patch, plan, FileOps(tmp_path))

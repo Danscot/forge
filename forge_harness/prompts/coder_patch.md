@@ -24,3 +24,16 @@ Rules:
 - Emit exactly one JSON object with a non-empty operations array. Do not include analysis or prose before or after it.
 - Return exactly one patch operation for every approved operation, using the same type and path. Never invent operations or omit approved ones. For each replace_text operation, use the exact approved old_text anchor; for each create_file operation, create only the planned path. If the approved plan does not include a HomeScreen/profile/screen file, do not create it in this patch.
 - Keep generated implementations concise but complete; avoid unnecessary comments and unrelated abstractions.
+
+VALIDATION AND ASSET RULES:
+- If LATEST DIAGNOSTICS includes `confirmed_validation_evidence.typecheck.diagnostics`, fix the exact compiler messages shown there before making unrelated visual changes. Never guess at a compile error when the actual compiler output is available.
+- Never create or overwrite raster image/font/audio/video/PDF files with string content. Do not emit an operation targeting `.png`, `.jpg`, `.jpeg`, `.webp`, `.gif`, `.ttf`, `.woff`, `.mp3`, `.mp4`, or `.pdf`. Use an existing asset path that was explicitly inventoried, or compose a placeholder from native React Native components.
+- Never invent local image paths. An `Image` source that points to a non-existent local file is not an asset implementation.
+
+FINAL COMPILER CONSISTENCY CHECK:
+- Before returning the patch, compare each confirmed TypeScript diagnostic in LATEST DIAGNOSTICS with the final contents of the planned file. Fix every diagnostic in that file in this operation; do not stop after fixing the first one.
+- If the compiler says a name is undefined, ensure the final file imports or defines it, or replace the usage with the correct already-imported component.
+- If a conditional style object such as `active && styles.tabActive` is being passed to a `color` prop, move it into the `style` prop and merge with an existing style expression instead of passing an object as a color.
+- Resolve relative imports against the target file's directory and the actual existing project tree. Do not assume a root-relative path.
+- Do not add fake image/font/media files as text. Use existing assets or native placeholders.
+

@@ -31,6 +31,7 @@ from ..tools.shell import ShellExecutionError, run_shell
 from ..utils.dashboard import Dashboard
 from ..utils.input_discovery import discover_inputs
 from ..utils.renderer import PlaywrightRenderer, RenderError
+from ..utils.typescript_repairs import apply_safe_typescript_repairs
 from ..utils.server import ExpoServer, ExpoServerError
 from .registry import ComponentRegistry
 from .router import RefinementRouter
@@ -220,7 +221,7 @@ class HarnessRunner:
                             vision_spec = vision_agent.specify(task, target_spec, self.file_ops, mockup_registry)
                             task.last_report["vision_spec"] = vision_spec
                             self.store.update_task(self.run_id, task.to_dict(), index)
-                        diagnostics_in = (task.last_report or {}).get("diagnostic", {})
+                        diagnostics_in = self._repair_context_from_last_report(task.last_report or {})
                         registry_snapshot = self.registry.refresh()
                         self.dashboard.active_agent = "coder"
                         self.active_agent = "coder"
@@ -317,6 +318,27 @@ class HarnessRunner:
 
                         self._set_stage(ExecutionStage.RUNNING_TYPE_CHECKS)
                         typecheck = self._run_typecheck()
+                        if not typecheck.get("passed"):
+                            # Apply only deterministic source edits whose fix is directly
+                            # proven by a compiler diagnostic, and only inside files the
+                            # approved plan already allowed to be created/fully rewritten.
+                            # This catches low-ambiguity failures without spending the
+                            # remaining repair budget asking the model to rediscover them.
+                            safe_fixes = apply_safe_typescript_repairs(root, typecheck, approved_plan)
+                            if safe_fixes:
+                                self._log_event("typescript_safe_repairs_applied", {
+                                    "task_id": task.id,
+                                    "attempt": attempt_index + 1,
+                                    "fixes": safe_fixes,
+                                }, task.id)
+                                self.dashboard.activity_message(
+                                    "INFO",
+                                    "Applied compiler-directed repair(s): " + "; ".join(
+                                        f"{item['path']}: {item['fixes']}" for item in safe_fixes
+                                    )[:1100],
+                                )
+                                typecheck = self._run_typecheck()
+                                typecheck["safe_repairs"] = safe_fixes
                         self.dashboard.set_validation("TypeScript", "PASS" if typecheck.get("passed") else "FAIL")
                         evidence: dict[str, Any] = {
                             "typecheck": typecheck,
@@ -676,7 +698,88 @@ class HarnessRunner:
             return {"passed": True, "skipped": True, "exit_code": 0, "stdout": "Typecheck command disabled by config", "stderr": ""}
         result = self._run_command(command, timeout=120)
         result["passed"] = result.get("exit_code") == 0 and not result.get("timed_out")
+        if not result["passed"]:
+            output = "\n".join(part for part in (str(result.get("stderr", "")), str(result.get("stdout", ""))) if part).strip()
+            excerpt = output[-8000:] or f"Typecheck exited with code {result.get('exit_code')} (timed_out={result.get('timed_out')}). No compiler output was captured."
+            self.logger.warning("TypeScript compiler diagnostics:\n%s", excerpt, extra={"exit_code": result.get("exit_code")})
+            if self.dashboard:
+                first_lines = [line.strip() for line in excerpt.splitlines() if line.strip()]
+                compact = " | ".join(first_lines[:3])[:900]
+                self.dashboard.activity_message("ERROR", f"TypeScript failed (exit {result.get('exit_code')}): {compact}")
+            self._log_event("typecheck_failed", {
+                "exit_code": result.get("exit_code"), "timed_out": result.get("timed_out"),
+                "diagnostics_excerpt": excerpt[-8000:],
+            }, self.current_task_id)
         return result
+
+    @staticmethod
+    def _repair_context_from_last_report(last_report: dict[str, Any]) -> dict[str, Any]:
+        """Merge model diagnosis with authoritative compiler/browser evidence for the next repair.
+
+        Earlier versions passed only the diagnostic agent's prose to the coder. That allowed a
+        guessed cause to replace the actual TypeScript errors that were present in the failed report.
+        """
+        diagnostic = last_report.get("diagnostic") or {}
+        context = dict(diagnostic) if isinstance(diagnostic, dict) else {}
+        evidence = last_report.get("evidence") or {}
+        if not isinstance(evidence, dict):
+            evidence = {}
+        confirmed: dict[str, Any] = {}
+
+        typecheck = evidence.get("typecheck") or {}
+        if isinstance(typecheck, dict):
+            output = "\n".join(
+                str(typecheck.get(key, "") or "") for key in ("stderr", "stdout")
+                if str(typecheck.get(key, "") or "").strip()
+            ).strip()
+            if typecheck.get("passed") is False or int(typecheck.get("exit_code", 0) or 0) != 0:
+                confirmed["typecheck"] = {
+                    "passed": False,
+                    "exit_code": typecheck.get("exit_code"),
+                    "timed_out": bool(typecheck.get("timed_out", False)),
+                    "diagnostics": (output[-6000:] if output else "The typecheck command failed but returned no compiler output."),
+                }
+                if output.strip():
+                    root_causes = list(context.get("root_causes") or [])
+                    authoritative = {
+                        "cause": "Confirmed TypeScript compiler errors from the previous attempt; repair these exact errors before visual refinements.",
+                        "evidence": output[-3500:],
+                        "confidence": "high",
+                    }
+                    context["root_causes"] = [authoritative] + [
+                        item for item in root_causes
+                        if not (isinstance(item, dict) and item.get("cause") == authoritative["cause"])
+                    ]
+
+        render = evidence.get("render") or {}
+        if isinstance(render, dict):
+            failed_tests = [
+                {key: step.get(key) for key in ("action", "selector", "description", "error") if step.get(key)}
+                for step in (render.get("test_results") or [])
+                if isinstance(step, dict) and not step.get("passed")
+            ][:5]
+            if failed_tests or render.get("page_errors"):
+                confirmed["browser"] = {
+                    "page_errors": list(render.get("page_errors") or [])[:5],
+                    "failed_tests": failed_tests,
+                }
+        if evidence.get("render_error"):
+            confirmed["render_error"] = str(evidence.get("render_error"))[:2500]
+        critic = last_report.get("critic") or evidence.get("critic") or {}
+        if isinstance(critic, dict) and critic.get("issues"):
+            confirmed["critic_issues"] = [
+                {key: item.get(key) for key in ("severity", "category", "description", "suggestion") if item.get(key)}
+                for item in critic.get("issues", [])[:5] if isinstance(item, dict)
+            ]
+        if evidence.get("stage_error"):
+            confirmed["stage_error"] = str(evidence.get("stage_error"))[:2500]
+        if confirmed:
+            context["confirmed_validation_evidence"] = confirmed
+            context["repair_priority"] = (
+                "Treat confirmed_validation_evidence as authoritative. Do not repeat a speculative diagnosis "
+                "when exact compiler output or failed browser assertions are provided. Fix the first confirmed gate failure first."
+            )
+        return context
 
     def _run_command(self, command: list[str] | str, timeout: int = 60) -> dict[str, Any]:
         if self.dashboard:
@@ -697,29 +800,20 @@ class HarnessRunner:
 
     @staticmethod
     def _requires_visual_review(task: Task) -> bool:
-        """Require page-level visual acceptance only when this task owns that UI.
-
-        A whole-page mockup is often included in the run manifest and may be
-        mistakenly attached to a foundation task by the master planner. That must
-        not cause an incomplete root shell to be judged as the final screen.
-        Explicit mockup-driven shared components may still request visual review.
-        """
+        """Visual acceptance belongs to screen/integration tasks or an explicit mockup."""
         task_type = str(task.type or "").strip().lower()
-        return task_type in {"screen", "integration"} or (
-            task_type == "shared_component" and bool(task.mockup_paths)
-        )
+        return bool(task.mockup_paths) or task_type in {"screen", "integration"}
 
     @staticmethod
     def _requires_functional_review(task: Task) -> bool:
-        """Run screen selectors only for screen/integration or focused mockup components.
+        """Browser interaction assertions are scoped to a screen, integration, or mockup.
 
-        Foundation/design-token tasks may smoke-render the application, but must not
-        be forced to satisfy controls/selectors that a later screen task will add.
+        Foundation/design-token/shared-component tasks may smoke-render the existing
+        application, but must not be forced to satisfy screen-level selectors before a
+        later task mounts those components.
         """
         task_type = str(task.type or "").strip().lower()
-        return task_type in {"screen", "integration"} or (
-            task_type == "shared_component" and bool(task.mockup_paths)
-        )
+        return bool(task.mockup_paths) or task_type in {"screen", "integration"}
 
     @classmethod
     def _effective_test_plan(cls, task: Task) -> list[dict[str, Any]]:
@@ -742,12 +836,7 @@ class HarnessRunner:
         if cfg.get("require_runtime_render", True) and not render:
             render_pass = False
         task_type = str(task_type or "").strip().lower()
-        # `has_mockup` alone is not enough to make a foundation task responsible for
-        # the page: planner output can accidentally attach the same reference to both
-        # foundation and screen tasks. Keep full interaction acceptance scoped to the
-        # task that owns the screen (or an explicitly mockup-driven shared component).
-        mockup_component_scope = task_type == "shared_component" and has_mockup
-        functional_gate_required = bool(task_type in {"screen", "integration"} or mockup_component_scope)
+        functional_gate_required = bool(task_type in {"screen", "integration"} or has_mockup)
         task_tests = (render or {}).get("test_results", [])
         task_tests_pass = all(item.get("passed", False) for item in task_tests)
         custom_pass = custom_functional is None or bool(custom_functional.get("passed"))
@@ -770,7 +859,7 @@ class HarnessRunner:
         # is not valid evidence that the shared-component task failed.
         visual_gate_required = bool(
             task_type in {"screen", "integration"}
-            or (mockup_component_scope and cfg.get("require_visual_critic_when_mockup_exists", True))
+            or (has_mockup and cfg.get("require_visual_critic_when_mockup_exists", True))
         )
         weights = cfg.get("functional_weight", 0.6), cfg.get("visual_weight", 0.4)
         functional_score = float((critic or {}).get("functional_score", 100 if functional_pass else 0))

@@ -93,3 +93,24 @@ def test_snapshot_restore_removes_unvalidated_created_files(tmp_path: Path):
     }})
     assert not created.exists()
     assert existing.read_text(encoding="utf-8") == "original"
+
+
+def test_text_patch_rejects_fabricated_png_assets(tmp_path: Path):
+    ops = FileOps(tmp_path)
+    with pytest.raises(FileOperationError, match="cannot create or overwrite binary asset"):
+        ops.apply_operations([
+            {"type": "create_file", "path": "assets/images/logo.png", "content": "not real png bytes"}
+        ])
+    assert not (tmp_path / "assets/images/logo.png").exists()
+
+
+def test_text_patch_rejects_overwriting_existing_binary_assets(tmp_path: Path):
+    target = tmp_path / "assets" / "icon.png"
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"\x89PNG\r\n\x1a\noriginal")
+    ops = FileOps(tmp_path)
+    with pytest.raises(FileOperationError, match="cannot create or overwrite binary asset"):
+        ops.apply_operations([
+            {"type": "overwrite_file", "path": "assets/icon.png", "content": "replacement text"}
+        ])
+    assert target.read_bytes().startswith(b"\x89PNG")

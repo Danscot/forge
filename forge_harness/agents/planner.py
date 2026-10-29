@@ -99,42 +99,6 @@ class PlannerAgent(BaseAgent):
         known: set[str] = set()
         root = file_ops.root
         known_mockups = {str(item.get("path")) for item in input_manifest.get("mockups", [])}
-
-        # A mockup is the acceptance target for a screen, not for its foundation
-        # task. Models sometimes attach the same whole-page reference to both the
-        # foundation and screen tasks. Move that assignment to the screen task when
-        # the screen task otherwise has no explicit mockup, so vision analysis and
-        # browser/visual gates run at the correct point in the task queue.
-        screen_task_indexes = [
-            i for i, item in enumerate(raw_tasks)
-            if isinstance(item, dict) and str(item.get("type", "screen")) in {"screen", "integration"}
-        ]
-        explicitly_screen_assigned = {
-            str(path)
-            for i in screen_task_indexes
-            for path in (raw_tasks[i].get("mockup_paths", []) or [])
-            if str(path) in known_mockups
-        }
-        foundation_assigned = {
-            str(path)
-            for item in raw_tasks
-            if isinstance(item, dict) and str(item.get("type", "screen")) in {"foundation", "design_tokens"}
-            for path in (item.get("mockup_paths", []) or [])
-            if str(path) in known_mockups
-        }
-        unassigned_foundation_mockups = sorted(foundation_assigned - explicitly_screen_assigned)
-        if screen_task_indexes and unassigned_foundation_mockups:
-            # A single screen is unambiguous. For multi-screen plans, add these
-            # references to the first screen lacking an explicit mapping instead of
-            # letting a foundation task consume them.
-            destination = next(
-                (i for i in screen_task_indexes if not (raw_tasks[i].get("mockup_paths") or [])),
-                screen_task_indexes[0] if len(screen_task_indexes) == 1 else None,
-            )
-            if destination is not None:
-                current = list(raw_tasks[destination].get("mockup_paths", []) or [])
-                raw_tasks[destination]["mockup_paths"] = list(dict.fromkeys(current + unassigned_foundation_mockups))
-
         for index, raw in enumerate(raw_tasks):
             if not isinstance(raw, dict):
                 raise AgentOutputError(f"Planner task {index + 1} is not an object")
@@ -150,19 +114,15 @@ class PlannerAgent(BaseAgent):
             if not mockup_paths and raw.get("screen"):
                 needle = str(raw["screen"]).lower().replace(" ", "_")
                 mockup_paths = [str(item["path"]) for item in input_manifest.get("mockups", []) if needle in Path(str(item.get("path", ""))).stem.lower()]
-            if task_type in {"foundation", "design_tokens"}:
-                # Keep page screenshots out of foundation prompts. Otherwise the
-                # coder tends to implement the entire screen inside App.tsx during
-                # the shell task, and the final-screen checks can run too early.
-                mockup_paths = []
             dependencies = [str(dependency) for dependency in raw.get("dependencies", []) if str(dependency) in known]
-            # Screen behavior is verified only on screen/integration tasks. A mockup
-            # assigned to a shared_component can still drive focused component review,
-            # but foundation/design-token tasks never inherit those screen selectors.
+            # Browser interaction plans describe an implemented screen, not a future
+            # screen that a foundation/design-system task has not composed yet. Keep
+            # planner output in scope: only screen/integration tasks (or tasks tied to
+            # an explicit mockup) may execute browser-level test steps.
             raw_test_plan = [step for step in raw.get("test_plan", []) if isinstance(step, dict)]
             route = str(raw.get("route") or "/")
-            test_plan = raw_test_plan if (task_type in {"screen", "integration"} or (task_type == "shared_component" and mockup_paths)) else []
-            if task_type in {"screen", "integration"} or (task_type == "shared_component" and mockup_paths):
+            test_plan = raw_test_plan if (task_type in {"screen", "integration"} or mockup_paths) else []
+            if task_type in {"screen", "integration"} or mockup_paths:
                 test_plan = self._ensure_route_activation(route, test_plan)
             task = Task(
                 id=task_id,

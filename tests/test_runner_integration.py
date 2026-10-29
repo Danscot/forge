@@ -159,3 +159,42 @@ def test_runner_completes_simple_screen_with_mock_provider(monkeypatch, tmp_path
         server.shutdown()
         server.server_close()
         thread.join(timeout=1)
+
+
+def test_retry_context_preserves_authoritative_typescript_diagnostics():
+    context = HarnessRunner._repair_context_from_last_report({
+        "diagnostic": {
+            "root_causes": [{"cause": "Maybe the See All text is invalid", "evidence": "guess", "confidence": "low"}],
+            "next_steps": ["Check the JSX"],
+        },
+        "evidence": {
+            "typecheck": {
+                "passed": False,
+                "exit_code": 2,
+                "stdout": "src/screens/DiscoverScreen.tsx(41,17): error TS2304: Cannot find name 'themeX'.",
+                "stderr": "",
+            },
+            "render": {"test_results": [{"action": "assert_visible", "selector": "[data-testid=course-card-0]", "passed": False, "error": "timeout"}]},
+        },
+    })
+    assert "confirmed_validation_evidence" in context
+    assert "TS2304" in context["confirmed_validation_evidence"]["typecheck"]["diagnostics"]
+    assert context["root_causes"][0]["confidence"] == "high"
+    assert "TS2304" in context["root_causes"][0]["evidence"]
+    assert context["confirmed_validation_evidence"]["browser"]["failed_tests"][0]["selector"] == "[data-testid=course-card-0]"
+
+
+def test_vision_agent_lists_only_real_assets(tmp_path: Path):
+    from forge_harness.agents.vision_spec_agent import VisionSpecAgent
+    from forge_harness.tools.file_ops import FileOps
+
+    (tmp_path / "assets").mkdir()
+    (tmp_path / "assets" / "icon.png").write_bytes(b"png")
+    (tmp_path / "assets" / "imaginary.png").write_bytes(b"png")
+    (tmp_path / "input" / "mockups").mkdir(parents=True)
+    (tmp_path / "input" / "mockups" / "reference.png").write_bytes(b"mockup")
+    result = VisionSpecAgent._available_asset_inventory(FileOps(tmp_path))
+    paths = {item["path"] for item in result}
+    assert "assets/icon.png" in paths
+    assert "assets/imaginary.png" in paths
+    assert "input/mockups/reference.png" not in paths
